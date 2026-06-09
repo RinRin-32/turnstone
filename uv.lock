@@ -2324,7 +2324,7 @@ wheels = [
 
 [[package]]
 name = "turnstone"
-version = "1.6.0a12"
+version = "1.6.0rc1"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
