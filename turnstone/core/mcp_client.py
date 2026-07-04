@@ -458,6 +458,12 @@ class StaticServerState:
     tools: list[dict[str, Any]] = field(default_factory=list)
     resources: list[dict[str, Any]] = field(default_factory=list)
     prompts: list[dict[str, Any]] = field(default_factory=list)
+    # Dispatch counter for the health-loop eviction interlock (mirrors
+    # ``PoolEntryState.in_flight``): the liveness ping skips and never evicts a
+    # server with ``in_flight > 0`` so a long-running ``call_tool`` pins its
+    # session against teardown. Incremented/decremented on the mcp-loop around
+    # the session op by ``_static_session_op``.
+    in_flight: int = 0
     supports_list_changed: bool = False
     supports_resources: bool = False
     supports_prompts: bool = False
@@ -713,6 +719,14 @@ class MCPClientManager:
         self._user_token_refresh_keepalive_s = float(
             mcp_cfg.get("user_token_refresh_keepalive_seconds", 1800)
         )
+        # Static-server health loop: liveness-ping cadence (seconds). Each tick
+        # pings every connected static server (evicting a dead-but-idle one so it
+        # is reconnected) and retries any disconnected one on a capped, jittered,
+        # forever backoff. The SDK gives up reconnecting after 2 attempts with no
+        # backoff (verified: mcp 1.28.1) and never for other transports, so this
+        # is Turnstone's own reconnect — nothing upstream to lean on. <= 0
+        # disables the loop entirely.
+        self._static_health_check_s = float(mcp_cfg.get("static_health_check_seconds", 30))
 
         # OAuth integration. ``set_app_state`` wires app_state in after the
         # lifespan has built the token store / OAuth helpers; pool dispatch
@@ -749,6 +763,22 @@ class MCPClientManager:
         # pass, so a recovered or re-consented grant re-arms the surfacing.
         # Loop-only mutation.
         self._token_sweep_warned: set[tuple[str, str]] = set()
+        # Static-server health loop handle (started once in ``_connect_all``).
+        self._static_health_task: asyncio.Task[None] | None = None
+        # Per-server connect serialization. ``_connect_one`` tears down and
+        # rebuilds the SHARED ``StaticServerState``; two concurrent reconnects
+        # for one server (health loop + a dispatch's ``_cb_auto_reconnect``, or
+        # an operator refresh) would interleave that teardown and corrupt the
+        # entry. This per-name lock serializes them. Lazily created on the
+        # mcp-loop (the asyncio.Lock allocation invariant).
+        self._static_connect_locks: dict[str, asyncio.Lock] = {}
+        # Per-server reconnect backoff state (health loop only, loop-bound):
+        # consecutive-failure ``attempt`` count and the monotonic time of the
+        # next allowed reconnect attempt. Capped + jittered, no attempt limit.
+        self._static_reconnect_attempt: dict[str, int] = {}
+        self._static_reconnect_next: dict[str, float] = {}
+        # Per-server next liveness-ping deadline (monotonic).
+        self._static_next_ping: dict[str, float] = {}
 
         # Strong references to fire-and-forget background tasks (catalog
         # refreshes etc.).  ``create_task`` alone keeps only a weak ref — an
@@ -847,6 +877,14 @@ class MCPClientManager:
         if self._user_token_sweep_s > 0 and self._user_token_sweep_task is None:
             self._user_token_sweep_task = asyncio.create_task(self._user_token_sweep_loop())
 
+        # Start the static-server health loop (once, on the mcp-loop). Self-heals
+        # static connections that the SDK's bounded reconnect / other transports
+        # abandon — the autonomous trigger Turnstone otherwise lacks (all other
+        # reconnect paths are dispatch- or operator-driven). Skipped when disabled
+        # via config (cadence <= 0).
+        if self._static_health_check_s > 0 and self._static_health_task is None:
+            self._static_health_task = asyncio.create_task(self._static_health_loop())
+
     _CONNECT_TIMEOUT = 30  # seconds — prevents hung connections on broken remotes
     _TCP_PROBE_TIMEOUT = 5  # seconds — fast TCP pre-flight for HTTP transports
 
@@ -854,6 +892,39 @@ class MCPClientManager:
     _CB_FAILURE_THRESHOLD = 3
     _CB_BASE_COOLDOWN = 30.0  # seconds
     _CB_MAX_COOLDOWN = 300.0  # 5 minutes
+
+    # Static-server reconnect backoff (health loop). Capped exponential + full
+    # jitter, retry FOREVER (no attempt limit): a server that returns after a
+    # long outage reconnects within ~a minute, and a permanently-misconfigured
+    # one costs at most one attempt per ``_STATIC_RECONNECT_MAX_S``. The cap is
+    # deliberately tighter than ``_CB_MAX_COOLDOWN`` (which gates dispatch
+    # fail-fast, a different clock) so recovery is prompt.
+    _STATIC_RECONNECT_BASE_S = 1.0
+    _STATIC_RECONNECT_MAX_S = 60.0
+    # Liveness-ping timeout. Deliberately generous (a slow-but-working server
+    # must not churn): a ping that times out is treated as "slow, not dead" —
+    # rescheduled, NOT evicted (only a ``_is_dead_transport`` failure evicts).
+    # Well beyond the 120s dispatch call is unnecessary; a ping is a lightweight
+    # round-trip, but heavy servers / congested links can still take seconds.
+    _STATIC_HEALTH_PING_TIMEOUT_S = 30.0
+    # Outer bound on a single autonomous reconnect ATTEMPT. ``_connect_one_locked``
+    # bounds only the handshake (``_CONNECT_TIMEOUT``); its post-handshake
+    # ``list_tools``/``list_resources``/``list_prompts`` are unbounded, so a server
+    # that handshakes then stalls discovery would wedge the loop AND hold the
+    # per-name lock forever. Bound from the caller side (invariant: never edit
+    # ``_connect_one_locked``'s connect internals) with headroom for a worst-case
+    # handshake plus fast discovery.
+    _STATIC_RECONNECT_ATTEMPT_TIMEOUT_S = float(_CONNECT_TIMEOUT + 15)
+
+    # Caller-side wait for a reconnect routed through ``_ensure_static_connected``
+    # (a dispatch's ``_cb_auto_reconnect``, operator ``reconnect_sync`` /
+    # ``remove_server_sync``). MUST exceed ``_STATIC_RECONNECT_ATTEMPT_TIMEOUT_S``
+    # so the primitive's inner bound always fires FIRST — surfacing a clean
+    # ``TimeoutError`` the primitive converts, cleans up, and records on the
+    # breaker — instead of the caller cancelling mid-attempt and leaving a
+    # half-discovered session installed with no breaker record, or an operator
+    # teardown silently timing out behind a slow reconnect that holds the lock.
+    _STATIC_RECONNECT_CALLER_TIMEOUT_S = _STATIC_RECONNECT_ATTEMPT_TIMEOUT_S + 10.0
 
     # Notification debounce
     _NOTIFICATION_DEBOUNCE = 5.0  # seconds between refreshes per server
@@ -876,6 +947,22 @@ class MCPClientManager:
     _POOL_EVICTION_LOCK_ACQUIRE_TIMEOUT_S = 0.05
 
     # -- circuit breaker (per-server) -----------------------------------------
+
+    @staticmethod
+    def _capped_exponential(base: float, cap: float, attempt: int) -> float:
+        """``min(cap, base * 2**attempt)`` with the exponent clamped.
+
+        The ONE capped-exponential formula — shared by the circuit-breaker
+        cooldown (:meth:`_cb_record_failure`) and the health loop's reconnect
+        ceiling (:meth:`_static_reconnect_delay`) — so cap/exponent policy
+        can't drift between the two. ``attempt`` is unbounded on the health
+        path (retry forever); the clamp keeps ``2**n`` from exploding into a
+        bignum before ``min`` discards it. Jitter policy stays with the
+        callers (full jitter on the health path, name-seeded 10% on the
+        breaker).
+        """
+        ceiling: float = min(cap, base * (2 ** min(attempt, 32)))
+        return ceiling
 
     def _cb_check(self, name: str) -> tuple[bool, bool]:
         """Check circuit breaker state for *name*.
@@ -902,7 +989,9 @@ class MCPClientManager:
         # already >= threshold).
         if count >= self._CB_FAILURE_THRESHOLD and name not in self._circuit_open_until:
             trips = self._circuit_trip_count.get(name, 0)
-            cooldown = min(self._CB_BASE_COOLDOWN * (2**trips), self._CB_MAX_COOLDOWN)
+            cooldown = self._capped_exponential(
+                self._CB_BASE_COOLDOWN, self._CB_MAX_COOLDOWN, trips
+            )
             # Per-server jitter seeded from server name (varies across process
             # restarts via PYTHONHASHSEED, which is desirable — each cluster
             # node gets different jitter to avoid thundering herd).
@@ -1051,28 +1140,181 @@ class MCPClientManager:
         await self._pre_close_streams(key)
         await self._safe_close_stack(stack)
 
+    async def _teardown_static_session(self, name: str) -> None:
+        """Tear down a static server's session/stack (the ONE canonical order).
+
+        Shared by :meth:`_connect_one_locked`'s stale-guard and
+        :meth:`remove_server_sync` so a future ordering fix lands in one place:
+        null the session FIRST (concurrent dispatch reads see "disconnected",
+        not a corpse), pre-close the transport streams (unblocks anyio tasks
+        stuck on zero-buffer ``send()`` — SDK #2147), then close the captured
+        stack. MUST run under the per-name connect lock. Callers decide WHEN
+        teardown is safe — live-session reuse and the ``in_flight`` interlock
+        are enforced by :meth:`_ensure_static_connected`, not here. No-op when
+        the server has no state.
+        """
+        state = self._static_servers.get(name)
+        if state is None:
+            return
+        state.session = None
+        await self._pre_close_streams(name)
+        old_stack = state.stack
+        state.stack = None
+        if old_stack is not None:
+            await self._safe_close_stack(old_stack)
+
+    def _static_connect_lock_for(self, name: str) -> asyncio.Lock:
+        """Return the per-server connect lock for ``name`` (lazily created).
+
+        MUST be called on the mcp-loop — the asyncio.Lock allocation invariant.
+        """
+        lock = self._static_connect_locks.get(name)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._static_connect_locks[name] = lock
+        return lock
+
     async def _connect_one(self, name: str, cfg: dict[str, Any]) -> None:
-        """Connect to a single MCP server and discover its tools."""
+        """Connect to a single MCP server, serialized per server.
+
+        Wraps :meth:`_connect_one_locked` in the per-name connect lock so a
+        health-loop reconnect, a dispatch ``_cb_auto_reconnect``, and an operator
+        refresh can never interleave teardown/rebuild on the shared
+        ``StaticServerState`` (which would corrupt the entry or leak a stack).
+        No caller holds the lock before calling in, and the body never re-enters
+        ``_connect_one`` for the same name, so there is no reentrancy risk.
+        """
         if "__" in name:
             log.error("MCP server name '%s' contains '__' (reserved delimiter), skipping", name)
             return
+        async with self._static_connect_lock_for(name):
+            await self._connect_one_locked(name, cfg)
 
+    async def _ensure_static_connected(
+        self, name: str, cfg: dict[str, Any], *, defer_if_busy: bool = True
+    ) -> Any:
+        """Idempotently (re)connect static server *name* — the ONE lazy path.
+
+        Every lazy/autonomous reconnect driver — the health loop
+        (:meth:`_static_reconnect_one`), a dispatch's :meth:`_cb_auto_reconnect`,
+        and :meth:`_refresh_all`'s reconnect branch — routes through here so the
+        per-name lock / session-reuse / ``in_flight`` / config-recheck / breaker
+        decisions live in exactly one place. The operator's
+        :meth:`reconnect_sync` deliberately does NOT: that is a FORCE rebuild
+        which tears down even a live session by design.
+
+        MUST run on the mcp-loop. All decisions are made UNDER the per-name
+        connect lock (concurrent callers QUEUE, then land in the reuse branch):
+
+        1. **Config re-check** — a concurrent :meth:`remove_server_sync` pops
+           the config (and retires the lock object) before tearing down;
+           rebuilding from the caller's pre-lock ``cfg`` snapshot would
+           resurrect the removed server. The freshest config wins — *cfg* is
+           the caller's eligibility proof, superseded here.
+        2. **Reuse-if-live** — another driver already (re)connected while we
+           queued; a live session is NEVER torn down and rebuilt here.
+        3. **``in_flight`` guard** — ``session is None`` with ``in_flight > 0``
+           means a sibling call is still running on the old (evicted-but-open)
+           stack; :meth:`_connect_one_locked`'s stale-guard teardown would
+           abort it mid-flight. Defer — the next driver pass reconnects once
+           it drains (mirrors the pool path's ``_close_pool_entry_if_idle``).
+        4. **Bounded connect** — :meth:`_connect_one_locked` under
+           ``_STATIC_RECONNECT_ATTEMPT_TIMEOUT_S`` from the caller side
+           (invariant: never edit its connect internals; its own bounds cover
+           only the handshake, not discovery).
+
+        The circuit breaker is OWNED here for connect outcomes — callers must
+        not record the connect again. Success clears only the OPEN-CIRCUIT
+        DEADLINE (dispatch flows again) and deliberately NOT
+        ``_consecutive_failures``: a connect-ok / calls-fail server must still
+        escalate to a trip; a real dispatch success is what resets the count
+        (:meth:`_cb_record_success`). Failure records one breaker failure and
+        re-raises.
+
+        Returns the session on success or reuse; ``None`` on a deliberate skip
+        (server removed, or busy with an in-flight call); raises on a real
+        connect failure. A genuine task cancellation propagates untouched — no
+        breaker record, since a cancelled attempt proves nothing about the
+        server.
+        """
+        if "__" in name:
+            # Mirrors _connect_one's reserved-delimiter guard: such a name can
+            # never connect; treat as a deliberate skip.
+            log.error("MCP server name '%s' contains '__' (reserved delimiter), skipping", name)
+            return None
+        lock = self._static_connect_lock_for(name)
+        async with lock:
+            # (1) Config re-check. The lock-identity check closes the
+            # remove -> re-add race: remove_server_sync retires the lock object
+            # after teardown, so a waiter still holding the OLD lock must not
+            # connect concurrently with a NEW-lock holder after a re-add.
+            fresh_cfg = self._server_configs.get(name)
+            if fresh_cfg is None or self._static_connect_locks.get(name) is not lock:
+                return None
+            cfg = fresh_cfg
+            state = self._static_servers.get(name)
+            # (2) Reuse-if-live.
+            if state is not None and state.session is not None:
+                return state.session
+            # (3) in_flight guard — AUTONOMOUS callers only (``defer_if_busy``).
+            # A sibling call is still draining on the old (evicted-but-open)
+            # stack; a rebuild's stale-guard teardown would abort it. The health
+            # loop and ``_refresh_all`` defer (they retry on their own schedule);
+            # a DISPATCH is a deliberate user action that NEEDS the session now,
+            # so it does not defer — it reconnects (the pre-unification behavior),
+            # accepting it may tear a sibling down rather than hard-fail a
+            # reachable server.
+            if defer_if_busy and state is not None and state.in_flight > 0:
+                return None
+            # (4) Bounded connect; the breaker is owned here. The inner bound is
+            # STRICTLY below every caller's wait (``_STATIC_RECONNECT_CALLER_
+            # TIMEOUT_S``), so it fires first and asyncio.timeout converts the
+            # cancel to TimeoutError inside the lock — the caller never cancels a
+            # live attempt out from under us.
+            try:
+                async with asyncio.timeout(self._STATIC_RECONNECT_ATTEMPT_TIMEOUT_S):
+                    await self._connect_one_locked(name, cfg)
+            except BaseException as exc:
+                # ANY non-success exit — an ``except Exception`` connect error,
+                # the converted inner TimeoutError, or a bare CancelledError (a
+                # caller's sync boundary giving up early, or a genuine shutdown)
+                # — must not leave a half-discovered session installed. We hold
+                # the lock, so no concurrent driver installed a fresh session.
+                #
+                # A CancelledError proves nothing about the server (the caller
+                # may have given up before the connect completed) — skip the
+                # breaker record so a spurious cancel doesn't inflate the
+                # failure count for a healthy server. The caller provides its
+                # own accounting (or doesn't — shutdown state is discarded).
+                if not isinstance(exc, asyncio.CancelledError):
+                    self._cb_record_failure(name)
+                await self._teardown_static_session(name)
+                raise
+            state = self._static_servers.get(name)
+            if state is None or state.session is None:
+                # e.g. a stdio config with no command "connects" without a
+                # session — a real failure for a reconnect driver.
+                self._cb_record_failure(name)
+                raise RuntimeError(f"MCP server '{name}' reconnect produced no session")
+            # Finding-13 semantics: clear only the open-circuit deadline.
+            self._circuit_open_until.pop(name, None)
+            return state.session
+
+    async def _connect_one_locked(self, name: str, cfg: dict[str, Any]) -> None:
+        """Connect to a single MCP server and discover its tools.
+
+        MUST run under the per-server connect lock (see :meth:`_connect_one`).
+        """
         # Operate on a single state object throughout: get-or-create up front
         # so the stale-entry guard and the post-handshake field assignments
         # touch the same instance (PR #296 invariant 5: identity stability).
         state = self._ensure_static_state(name)
 
-        # Guard: tear down stale session/stack so we don't leak.  Checks both
-        # session and stack because transport errors in the sync dispatch
-        # methods evict the session but leave the stack behind.  On a brand
-        # new entry both fields are None, so this branch is skipped.
-        if state.session is not None or state.stack is not None:
-            state.session = None
-            await self._pre_close_streams(name)
-            old_stack = state.stack
-            state.stack = None
-            if old_stack is not None:
-                await self._safe_close_stack(old_stack)
+        # Guard: tear down stale session/stack so we don't leak.  Transport
+        # errors in the sync dispatch methods evict the session but leave the
+        # stack behind; ``_teardown_static_session`` clears both (and is a
+        # no-op on a brand new entry).
+        await self._teardown_static_session(name)
 
         # Per-server exit stack for clean per-server lifecycle management
         stack = AsyncExitStack()
@@ -2831,12 +3073,22 @@ class MCPClientManager:
             try:
                 state = self._static_servers.get(name)
                 if state is None or state.session is None:
-                    # Attempt reconnect
+                    # Attempt reconnect via the shared lazy primitive — it owns
+                    # the per-name lock, live-session reuse, the in_flight
+                    # deferral, and the breaker (so no separate
+                    # ``_cb_record_success`` here: only the open-circuit
+                    # deadline is cleared; a real dispatch resets the count).
                     cfg = self._server_configs.get(name)
                     if cfg:
                         log.info("Reconnecting MCP server '%s'", name)
-                        await self._connect_one(name, cfg)
-                        self._cb_record_success(name)
+                        session = await self._ensure_static_connected(name, cfg)
+                        if session is None:
+                            # Deliberate skip: removed concurrently, or a
+                            # sibling call is still in flight on the old
+                            # stack. Not a failure — the next refresh or
+                            # health tick retries.
+                            results[name] = ([], [])
+                            continue
                         post = self._static_servers.get(name)
                         new_names = (
                             [t["function"]["name"] for t in post.tools] if post is not None else []
@@ -3367,6 +3619,14 @@ class MCPClientManager:
                     with contextlib.suppress(BaseException):
                         await self._user_token_sweep_task
                     self._user_token_sweep_task = None
+                # Static health loop is a dedicated handle (not in
+                # _background_tasks); cancel it here so a static-only deployment
+                # — which skips the pool-teardown block below — still stops it.
+                if self._static_health_task is not None:
+                    self._static_health_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await self._static_health_task
+                    self._static_health_task = None
                 tasks = list(self._background_tasks)
                 for task in tasks:
                     task.cancel()
@@ -3483,6 +3743,11 @@ class MCPClientManager:
         self._user_pool_eviction_task = None
         self._user_token_sweep_task = None
         self._token_sweep_warned.clear()
+        self._static_health_task = None
+        self._static_connect_locks.clear()
+        self._static_reconnect_attempt.clear()
+        self._static_reconnect_next.clear()
+        self._static_next_ping.clear()
 
         log.info("MCP client shut down")
 
@@ -3540,7 +3805,9 @@ class MCPClientManager:
             "error": "",
         }
 
-    def reconnect_sync(self, name: str, timeout: int = 30) -> dict[str, Any]:
+    def reconnect_sync(
+        self, name: str, timeout: float = _STATIC_RECONNECT_CALLER_TIMEOUT_S
+    ) -> dict[str, Any]:
         """Force a fresh connection to an MCP server (blocks the calling thread).
 
         Tears down the current session/transport (if any), clears the circuit
@@ -3569,29 +3836,44 @@ class MCPClientManager:
 
         async def _reconnect() -> None:
             self._cb_clear(name)
-            state = self._static_servers.get(name)
-            if state is not None:
-                state.session = None
-                await self._pre_close_streams(name)
-                old_stack = state.stack
-                state.stack = None
-                if old_stack is not None:
-                    await self._safe_close_stack(old_stack)
-            try:
-                await self._connect_one(name, cfg)
-            except Exception:
-                # Connect failed mid-reconnect — drop the stale per-server
-                # catalog so the merged tool/resource/prompt maps don't keep
-                # advertising entries with no live session behind them.
-                fail_state = self._static_servers.get(name)
-                if fail_state is not None:
-                    fail_state.tools = []
-                    fail_state.resources = []
-                    fail_state.prompts = []
-                self._rebuild_tools()
-                self._rebuild_resources()
-                self._rebuild_prompts()
-                raise
+            # Hold the per-name connect lock across the FORCE rebuild so an
+            # autonomous health-loop / dispatch reconnect can never interleave
+            # its own teardown/rebuild on the shared ``StaticServerState``
+            # mid-flight (delivering the ``_connect_one`` docstring's "operator
+            # refresh can never interleave" claim). Call the LOCKED body
+            # directly — we hold the lock, and ``_connect_one`` would deadlock
+            # re-acquiring it. No explicit pre-teardown: ``_connect_one_locked``'s
+            # stale-guard runs the identical ``_teardown_static_session`` first
+            # thing, and an operator reconnect deliberately rebuilds even a
+            # live session (unlike the lazy ``_ensure_static_connected`` path).
+            async with self._static_connect_lock_for(name):
+                try:
+                    # Bounded connect — mirrors ``_ensure_static_connected``'s
+                    # inner timeout. The attempt bound covers discovery (the
+                    # one phase ``_connect_one_locked``'s handshake-only
+                    # ``_CONNECT_TIMEOUT`` does not cover), fires strictly
+                    # before the caller-side ``future.result(timeout=...)``,
+                    # and converts to ``TimeoutError`` inside the lock so the
+                    # catalog cleanup below runs instead of the connect being
+                    # externally cancelled mid-flight.
+                    async with asyncio.timeout(self._STATIC_RECONNECT_ATTEMPT_TIMEOUT_S):
+                        await self._connect_one_locked(name, cfg)
+                except BaseException:
+                    # Connect failed mid-reconnect — drop the stale per-server
+                    # catalog so the merged tool/resource/prompt maps don't keep
+                    # advertising entries with no live session behind them, and
+                    # null the session so a later health-loop check doesn't see
+                    # a live (but tool-less) session.
+                    fail_state = self._static_servers.get(name)
+                    if fail_state is not None:
+                        fail_state.tools = []
+                        fail_state.resources = []
+                        fail_state.prompts = []
+                        fail_state.session = None
+                    self._rebuild_tools()
+                    self._rebuild_resources()
+                    self._rebuild_prompts()
+                    raise
 
         future = asyncio.run_coroutine_threadsafe(_reconnect(), self._loop)
         try:
@@ -3617,7 +3899,9 @@ class MCPClientManager:
             "error": "",
         }
 
-    def remove_server_sync(self, name: str, timeout: int = 15) -> bool:
+    def remove_server_sync(
+        self, name: str, timeout: float = _STATIC_RECONNECT_CALLER_TIMEOUT_S
+    ) -> bool:
         """Disconnect and remove an MCP server at runtime (blocks the calling thread).
 
         All state mutations run on the MCP event loop thread to avoid races
@@ -3645,30 +3929,46 @@ class MCPClientManager:
         if self._loop is not None:
 
             async def _remove() -> None:
-                # Close session + transport via per-server stack
-                state = self._static_servers.get(name)
-                if state is not None:
-                    state.session = None
-                    await self._pre_close_streams(name)
-                    stack = state.stack
-                    state.stack = None
-                    if stack is not None:
-                        await self._safe_close_stack(stack)
-                # Clean up per-server state (on the event loop thread)
-                self._static_servers.pop(name, None)
-                self._last_error.pop(name, None)
-                self._last_notification_refresh.pop(name, None)
-                self._cb_clear(name)
-                # Rebuild merged state (serialized with notification handlers)
-                self._rebuild_tools()
-                self._rebuild_resources()
-                self._rebuild_prompts()
+                # Hold the per-name connect lock across teardown so an autonomous
+                # health-loop reconnect can't interleave (config was already
+                # popped above, so no NEW reconnect will start; this serializes
+                # against one already in flight).
+                async with self._static_connect_lock_for(name):
+                    # Close session + transport via per-server stack
+                    await self._teardown_static_session(name)
+                    # Clean up per-server state (on the event loop thread)
+                    self._static_servers.pop(name, None)
+                    self._last_error.pop(name, None)
+                    self._last_notification_refresh.pop(name, None)
+                    self._cb_clear(name)
+                    # Clear health-loop backoff/ping state so a later re-add of
+                    # the same name doesn't inherit stale ``due`` deadlines.
+                    self._static_reconnect_attempt.pop(name, None)
+                    self._static_reconnect_next.pop(name, None)
+                    self._static_next_ping.pop(name, None)
+                    # Rebuild merged state (serialized with notification handlers)
+                    self._rebuild_tools()
+                    self._rebuild_resources()
+                    self._rebuild_prompts()
+                # Drop the now-orphaned per-name lock AFTER releasing it (the
+                # server is gone; a re-add re-creates it lazily).
+                self._static_connect_locks.pop(name, None)
 
             future = asyncio.run_coroutine_threadsafe(_remove(), self._loop)
             try:
                 future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                # A slow reconnect held the per-name lock past our wait. CANCEL
+                # the pending ``_remove`` so it can't later pop a re-added entry
+                # (or its new lock) and corrupt state; report failure rather than
+                # a false "removed" (the default timeout exceeds the reconnect
+                # bound, so this is an edge — a caller passing a short timeout).
+                future.cancel()
+                log.warning("MCP server '%s' removal timed out; cancelled", name)
+                return False
             except Exception:
                 log.warning("Error removing MCP server '%s'", name, exc_info=True)
+                return False
         else:
             # No event loop (tests / pre-start) — mutate directly
             self._static_servers.pop(name, None)
@@ -4123,31 +4423,340 @@ class MCPClientManager:
         task.add_done_callback(_done)
         return task
 
+    # -- static-server health loop (autonomous reconnect + liveness) ----------
+
+    async def _static_health_loop(self) -> None:
+        """Long-running coroutine — keeps static MCP servers connected.
+
+        The autonomous reconnect Turnstone otherwise lacks. Every other reconnect
+        path is lazy (a tool dispatch, an operator refresh, a config edit), and
+        the SDK's own reconnect is a bounded 2-attempt burst on the
+        streamable-http GET stream ONLY (verified: mcp 1.28.1) — no backoff,
+        nothing for the other transports. So a static server that goes down and
+        comes back while nobody is dispatching to it stays dead until someone
+        acts. Each tick, on the mcp-loop:
+
+          * a DISCONNECTED server (``session is None``) is reconnected on a
+            capped, jittered, forever backoff (:meth:`_static_reconnect_delay`);
+          * a CONNECTED server is liveness-pinged (:meth:`_static_ping_one`) and a
+            dead-but-idle one — which the SDK leaves as a non-None session with
+            closed streams, so nothing else notices until a dispatch fails — is
+            evicted so the next tick reconnects it.
+
+        Backoff is the health loop's OWN clock; the circuit breaker stays the
+        DISPATCH fail-fast gate (a tool call to a down server errors immediately
+        rather than blocking on the forever-retry). The loop keeps breaker state
+        in sync so an open breaker closes once it reconnects. Static-only:
+        ``oauth_user`` pools are managed by their own paths.
+
+        Cancellation policy: only a GENUINE shutdown (``shutdown()`` cancelling
+        this task) stops the loop. A stray per-server ``CancelledError`` that
+        escapes the tick (a wedged anyio transport surfacing a cancel-scope
+        poison) must not silently kill the only autonomous reconnect driver —
+        ``Task.cancelling()`` is the discriminator, because a real cancel
+        request bumps the task's pending-cancel count before the
+        ``CancelledError`` is delivered.
+        """
+        while True:
+            try:
+                sleep_s = await self._static_health_tick()
+                await asyncio.sleep(sleep_s)
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if task is None or task.cancelling():
+                    return  # genuine shutdown
+                log.warning("MCP static health: stray cancellation absorbed; continuing")
+                await asyncio.sleep(self._static_health_check_s)
+            except Exception:
+                log.warning("MCP static health iteration failed", exc_info=True)
+                await asyncio.sleep(self._static_health_check_s)
+
+    async def _static_health_tick(self) -> float:
+        """One health pass. Returns seconds to sleep until the next due event.
+
+        MUST run on the mcp-loop. Servers are processed CONCURRENTLY (one slow
+        connect must not block liveness for every other server) with per-server
+        exception isolation. The returned sleep is against a FRESHLY-read clock —
+        the per-server work can take seconds, so the tick-start ``now`` is stale
+        by return — computed from the soonest per-server monotonic deadline and
+        clamped at 0.5s minimum to avoid busy-spinning (a deadline shorter
+        than 0.5s adds at most 0.5s latency before the next tick re-checks).
+        """
+        now = time.monotonic()
+        names = [
+            name
+            for name in list(self._server_configs.keys())
+            # Per-user pools are managed separately; ``__`` names can never
+            # connect (``_connect_one``'s reserved-delimiter guard), so retrying
+            # them forever would only spam ``log.error`` every interval.
+            if name not in self._oauth_user_server_names and "__" not in name
+        ]
+        if not names:
+            return self._static_health_check_s
+        results = await asyncio.gather(
+            *(self._static_health_one(name, now) for name in names),
+            return_exceptions=True,
+        )
+        # FRESH clock for every deadline computed after the gather — the
+        # per-server work above can burn tens of seconds, so ``now`` is stale.
+        after = time.monotonic()
+        soonest = after + self._static_health_check_s
+        for name, res in zip(names, results, strict=True):
+            if isinstance(res, BaseException):
+                # Per-server exception isolation — INCLUDING CancelledError. A
+                # genuine shutdown cancels the ``await gather`` itself, which
+                # raises CancelledError at the await directly (an outer cancel
+                # never lands in the results list, ``return_exceptions``
+                # notwithstanding) and propagates to ``_static_health_loop``'s
+                # shutdown path. A CancelledError IN the results is per-server
+                # fallout (a stray anyio cancel-scope poison from a wedged
+                # transport) — re-raising it here killed the whole loop.
+                log.debug(
+                    "MCP static health: server '%s' pass failed",
+                    name,
+                    exc_info=(type(res), res, res.__traceback__),
+                )
+                due = after + self._static_health_check_s
+            else:
+                due = res
+            soonest = min(soonest, due)
+        # Fresh clock (fix): deadlines are absolute-monotonic; sleeping
+        # ``soonest - now`` would over-sleep by the tick's own elapsed time.
+        return max(0.5, soonest - time.monotonic())
+
+    async def _static_health_one(self, name: str, now: float) -> float:
+        """Ping a connected server or reconnect a disconnected one; return its
+        next-due monotonic deadline. Runs concurrently per server in the tick."""
+        state = self._static_servers.get(name)
+        if state is not None and state.session is not None:
+            return await self._static_ping_one(name, now)
+        return await self._static_reconnect_one(name)
+
+    def _static_reconnect_delay(self, attempt: int) -> float:
+        """Full-jitter capped-exponential backoff: ``uniform(0, min(CAP, BASE*2^n))``.
+
+        Retry forever — ``attempt`` is unbounded; :meth:`_capped_exponential`
+        clamps the exponent before ``2**n`` explodes, so past the cap every
+        attempt draws from the same ``[0, CAP]`` window.
+        """
+        ceiling = self._capped_exponential(
+            self._STATIC_RECONNECT_BASE_S, self._STATIC_RECONNECT_MAX_S, attempt
+        )
+        return random.uniform(0.0, ceiling)
+
+    async def _static_reconnect_one(self, name: str) -> float:
+        """Reconnect a disconnected static server if its backoff has elapsed.
+
+        Returns the monotonic deadline of the next attempt so the loop can
+        sleep until then. Routes through :meth:`_ensure_static_connected` — if
+        another driver is mid-connect we queue briefly on the per-name lock and
+        then REUSE its session instead of piling a redundant rebuild on the
+        shared state; the primitive also owns the attempt bound and the breaker
+        (a failure here only advances the health loop's OWN backoff clock).
+
+        Uses a FRESH monotonic clock internally (not a caller-passed tick-start
+        snapshot that could be stale after a slow sibling ``gather``).
+        """
+        fresh_now = time.monotonic()
+        due = self._static_reconnect_next.get(name, fresh_now)
+        if fresh_now < due:
+            return due
+        cfg = self._server_configs.get(name)
+        if not cfg:
+            return time.monotonic() + self._static_health_check_s
+        try:
+            log.info("MCP static health: reconnecting '%s'", name)
+            session = await self._ensure_static_connected(name, cfg)
+        except Exception as exc:
+            # The primitive already recorded the breaker failure and dropped
+            # any partially-initialized session; only the health loop's own
+            # backoff state advances here.
+            attempt = self._static_reconnect_attempt.get(name, 0) + 1
+            self._static_reconnect_attempt[name] = attempt
+            delay = self._static_reconnect_delay(attempt)
+            next_due = time.monotonic() + delay
+            self._static_reconnect_next[name] = next_due
+            # Loud on the first few failures, then decays to debug so a long /
+            # permanent outage doesn't spam the log on every forever-retry.
+            log_fn = log.warning if attempt <= self._CB_FAILURE_THRESHOLD else log.debug
+            log_fn(
+                "MCP static health: reconnect '%s' failed (attempt %d), next in %.0fs: %s",
+                name,
+                attempt,
+                delay,
+                exc,
+            )
+            return next_due
+        if session is None:
+            # Deliberate skip — removed from config mid-flight, or a sibling
+            # dispatch is still in flight on the old (evicted) stack. Not a
+            # failure: no backoff bump, no breaker; re-check shortly.
+            return time.monotonic() + 1.0
+        # Success — reset the health-loop's own backoff, schedule the first ping,
+        # and reconcile catalog drift off the critical path (mirrors
+        # ``_cb_auto_reconnect``: the session is usable immediately). Breaker
+        # state was already settled by ``_ensure_static_connected``: only the
+        # open-circuit deadline cleared, the failure count kept so a
+        # connect-OK / calls-FAIL server still escalates to a trip — a real
+        # dispatch SUCCESS is what resets it.
+        self._static_reconnect_attempt.pop(name, None)
+        self._static_reconnect_next.pop(name, None)
+        next_ping = time.monotonic() + self._static_health_check_s
+        self._static_next_ping[name] = next_ping
+        self._spawn_background(
+            self._refresh_server(name),
+            f"catalog refresh after static health reconnect '{name}'",
+        )
+        log.info("MCP static health: reconnected '%s'", name)
+        return next_ping
+
+    def _schedule_next_ping(self, name: str) -> float:
+        """Set and return the next liveness-ping deadline (fresh monotonic clock)."""
+        next_ping = time.monotonic() + self._static_health_check_s
+        self._static_next_ping[name] = next_ping
+        return next_ping
+
+    async def _static_ping_one(self, name: str, now: float) -> float:
+        """Liveness-ping a connected static server; evict a dead-but-idle one.
+
+        Returns the monotonic deadline of the next ping. Classification mirrors
+        the dispatch path's ``_record_and_evict_on_dead_transport``:
+
+          * a genuinely DEAD transport (``_is_dead_transport``) is evicted
+            (``session = None``) so the next tick reconnects it, and its breaker
+            records a failure so dispatch fails fast meanwhile;
+          * a protocol ``McpError``, an ``httpx.PoolTimeout``, or a plain ping
+            TIMEOUT is "slow, not dead" — the ping is rescheduled WITHOUT evicting
+            or tripping the breaker (a strict 5s ping vs a 120s dispatch would
+            otherwise churn a heavy-but-working server every cycle);
+          * a BUSY server (``in_flight > 0``) is skipped entirely — it can't
+            answer a ping mid-call, and tearing it down would abort that call
+            (the ``StaticServerState`` in-flight interlock, mirroring the pool
+            path's ``_close_pool_entry_if_idle``).
+
+        Clock discipline: the tick-start *now* may gate "is it due?", but every
+        WRITTEN/RETURNED deadline uses a fresh ``time.monotonic()`` — after a
+        slow sibling op in the same gather a stale base lands the next ping in
+        the past and collapses the cadence into an every-tick re-ping.
+        """
+        # Recovered-server hygiene: a live session means any stale health-loop
+        # backoff (left by a dispatch/operator reconnect the loop didn't drive)
+        # is wrong — clear it so a later autonomous reconnect isn't delayed by a
+        # stale ``due``.
+        self._static_reconnect_attempt.pop(name, None)
+        self._static_reconnect_next.pop(name, None)
+
+        due = self._static_next_ping.get(name, now)
+        if now < due:
+            return due
+        state = self._static_servers.get(name)
+        session = state.session if state is not None else None
+        if session is None:
+            # Raced an eviction — due now; the reconnect path handles it next tick.
+            return time.monotonic()
+        if state is not None and state.in_flight > 0:
+            # Busy serving a dispatch → demonstrably alive; skip ping + evict.
+            return self._schedule_next_ping(name)
+        try:
+            # invariant-18: ``asyncio.timeout`` (NOT ``wait_for``) so ``send_ping``
+            # runs in THIS task and anyio cancel-scope exit stays same-task.
+            async with asyncio.timeout(self._STATIC_HEALTH_PING_TIMEOUT_S) as ping_timeout:
+                await session.send_ping()
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            # ``asyncio.timeout`` converts its OWN expiry to ``TimeoutError``;
+            # ``ping_timeout.expired()`` is the unambiguous signal. A wedged anyio
+            # transport can surface the timeout-scoped cancel as a stray
+            # CancelledError / BaseExceptionGroup, so we catch the full trio — but
+            # a bare CancelledError when the timeout did NOT fire is an EXTERNAL
+            # cancel (loop shutdown) and MUST propagate so ``_static_health_loop``
+            # stops via its ``except asyncio.CancelledError: return``.
+            if not ping_timeout.expired() and isinstance(exc, asyncio.CancelledError):
+                raise
+            if ping_timeout.expired():
+                dead = False
+            elif isinstance(exc, BaseExceptionGroup):
+                dead = any(_is_dead_transport(e) for e in exc.exceptions)
+            else:
+                dead = _is_dead_transport(exc)
+            # Re-check in-flight under this synchronous handler: a dispatch may
+            # have started during the ping window; never evict a busy server.
+            # Session-identity: only act on the session we actually PINGED — a
+            # concurrent reconnect may have installed a fresh one during the await
+            # window, and our stale ping's death says nothing about it (evicting
+            # or tripping the breaker for it would undo a good reconnect).
+            evict = self._static_servers.get(name)
+            busy = evict is not None and evict.in_flight > 0
+            if dead and evict is not None and not busy and evict.session is session:
+                self._cb_record_failure(name)
+                evict.session = None
+                asap = time.monotonic()
+                self._static_reconnect_next[name] = asap  # reconnect asap
+                self._static_reconnect_attempt.pop(name, None)
+                log.info(
+                    "MCP static health: '%s' failed liveness ping (%s); evicting to reconnect",
+                    name,
+                    type(exc).__name__,
+                )
+                return asap
+            # Slow / protocol / pool-saturation / busy / swapped-session: not an
+            # actionable death — reschedule, don't evict, don't trip the breaker.
+            log.debug(
+                "MCP static health: '%s' ping did not confirm liveness (%s); rescheduling",
+                name,
+                type(exc).__name__,
+            )
+            return self._schedule_next_ping(name)
+        return self._schedule_next_ping(name)
+
     def _cb_auto_reconnect(self, server_name: str) -> Any:
         """Attempt reconnection for a disconnected server during half-open probe.
 
-        Returns the new session on success, or raises on failure.
+        Returns the new (or concurrently re-established) session on success, or
+        raises on failure. Routes through :meth:`_ensure_static_connected`, so
+        the per-name lock, live-session reuse, config re-check, and the
+        ``in_flight`` deferral are shared with the health loop and
+        ``_refresh_all`` — a dispatch can never tear down, resurrect, or
+        blindly re-do a reconnect another driver already made.
+
+        Breaker ownership: connect outcomes are recorded INSIDE the primitive
+        only. The sync-boundary ``result(timeout=...)`` below deliberately
+        records NOTHING — its expiry usually means the per-name lock was merely
+        contended (a concurrent health-loop attempt is bounded at
+        ``_STATIC_RECONNECT_ATTEMPT_TIMEOUT_S``, above this wait), and counting
+        lock-wait as a server failure trips the breaker for a reachable server.
+        A cancelled attempt proves nothing; the next real connect outcome is
+        recorded where it is observed.
         """
         cfg = self._server_configs.get(server_name)
         if not cfg or self._loop is None:
             raise RuntimeError(f"MCP server '{server_name}' is not connected")
-        reconnect_future = asyncio.run_coroutine_threadsafe(
-            self._connect_one(server_name, cfg), self._loop
-        )
+
+        async def _reconnect_for_dispatch() -> Any:
+            # defer_if_busy=False: a dispatch NEEDS the session now and may tear
+            # down a sibling call rather than hard-fail a reachable server (the
+            # in_flight defer is for autonomous drivers that retry on their own).
+            return await self._ensure_static_connected(server_name, cfg, defer_if_busy=False)
+
+        # A fresh coroutine/task per attempt: a timed-out attempt is cancelled
+        # below, and the next dispatch starts clean instead of re-entering a
+        # half-cancelled anyio scope.
+        reconnect_future = asyncio.run_coroutine_threadsafe(_reconnect_for_dispatch(), self._loop)
         try:
-            reconnect_future.result(timeout=self._CONNECT_TIMEOUT)
+            session = reconnect_future.result(timeout=self._STATIC_RECONNECT_CALLER_TIMEOUT_S)
         except concurrent.futures.TimeoutError:
             reconnect_future.cancel()
-            self._cb_record_failure(server_name)
+            # No breaker record: see docstring — lock contention is not a
+            # server failure, and this boundary cannot tell the two apart.
             raise RuntimeError(f"MCP server '{server_name}' reconnect timed out") from None
         except Exception as exc:
-            self._cb_record_failure(server_name)
+            # Real connect failures were already recorded by the primitive;
+            # recording here again would double-count one outcome.
             raise RuntimeError(f"MCP server '{server_name}' reconnect failed: {exc}") from None
-        state = self._static_servers.get(server_name)
-        session = state.session if state is not None else None
         if session is None:
-            self._cb_record_failure(server_name)
-            raise RuntimeError(f"MCP server '{server_name}' reconnect produced no session")
+            # Deliberate skip: the server was removed while we queued, or a
+            # sibling call is still in flight on the old (evicted) stack. Fail
+            # this dispatch cleanly; not a breaker-worthy server failure.
+            raise RuntimeError(f"MCP server '{server_name}' is unavailable (removed or busy)")
 
         # Schedule catalog refresh on the loop without blocking the caller.
         # The reconnected session is valid for the imminent dispatch; catalog
@@ -4191,6 +4800,29 @@ class MCPClientManager:
             evict = self._static_servers.get(server_name)
             if evict is not None:
                 evict.session = None
+
+    async def _static_session_op(self, server_name: str, op: Coroutine[Any, Any, Any]) -> Any:
+        """Await a static session op on the mcp-loop, pinned against eviction.
+
+        Increments the server's ``in_flight`` counter for the duration of the
+        awaited op and decrements it in ``finally`` (mirrors the pool path's
+        ``entry.in_flight`` accounting at ``_dispatch_pool_with_entry``). The
+        health-loop ping skips and never evicts a server with ``in_flight > 0``,
+        so a long-running ``call_tool`` can't be torn down mid-flight by a
+        liveness reconnect. MUST be scheduled onto the mcp-loop; the
+        increment/decrement wraps ONLY the session op, not the sync bridge.
+        ``StaticServerState`` identity is stable across reconnects (PR #296
+        invariant 5: ``_ensure_static_state`` get-or-creates), so the same
+        object is decremented that was incremented.
+        """
+        state = self._static_servers.get(server_name)
+        if state is None:
+            return await op
+        state.in_flight += 1
+        try:
+            return await op
+        finally:
+            state.in_flight -= 1
 
     def call_tool_sync(
         self,
@@ -4260,7 +4892,8 @@ class MCPClientManager:
         assert self._loop is not None
 
         future = asyncio.run_coroutine_threadsafe(
-            session.call_tool(original_name, arguments), self._loop
+            self._static_session_op(server_name, session.call_tool(original_name, arguments)),
+            self._loop,
         )
         try:
             result = future.result(timeout=timeout)
@@ -5655,7 +6288,9 @@ class MCPClientManager:
             session = self._cb_auto_reconnect(server_name)
         assert self._loop is not None
 
-        future = asyncio.run_coroutine_threadsafe(session.read_resource(uri), self._loop)
+        future = asyncio.run_coroutine_threadsafe(
+            self._static_session_op(server_name, session.read_resource(uri)), self._loop
+        )
         try:
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
@@ -5748,7 +6383,10 @@ class MCPClientManager:
         assert self._loop is not None
 
         future = asyncio.run_coroutine_threadsafe(
-            session.get_prompt(original_name, arguments=arguments), self._loop
+            self._static_session_op(
+                server_name, session.get_prompt(original_name, arguments=arguments)
+            ),
+            self._loop,
         )
         try:
             result = future.result(timeout=timeout)
