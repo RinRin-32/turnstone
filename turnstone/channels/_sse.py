@@ -34,6 +34,7 @@ async def run_sse_stream(
     token_factory: Callable[[], str] | None,
     on_event: Callable[[ServerEvent], Awaitable[None]],
     on_stale: Callable[[], Awaitable[None]],
+    on_raw_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> None:
     """Run an SSE subscription loop with reconnect/backoff for one workstream.
 
@@ -127,6 +128,17 @@ async def run_sse_stream(
                             ws_id=ws_id,
                             exc_info=True,
                         )
+                    # Dispatch raw data for unregistered event types (e.g.
+                    # child_ws_* synthetic events from coordinator SSE).
+                    if on_raw_event is not None and type(event) is ServerEvent:
+                        try:
+                            await on_raw_event(data)
+                        except Exception:
+                            log.warning(
+                                f"{log_prefix}.raw_event_dispatch_failed",
+                                ws_id=ws_id,
+                                exc_info=True,
+                            )
 
         except httpx.HTTPStatusError as exc:
             # Already logged at WARNING inside the try block (the raise

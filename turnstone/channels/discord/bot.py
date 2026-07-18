@@ -501,17 +501,17 @@ class TurnstoneBot:
         *,
         token_factory: Callable[[], str] | None = None,
     ) -> None:
-        """SSE listener task for a workstream.
-
-        Delegates the reconnect/backoff loop to :func:`run_sse_stream`;
-        this wrapper just translates events to ``_on_ws_event`` calls and
-        handles the 404 stale-route case.
-        """
+        """SSE listener task for a workstream."""
         if token_factory is None:
             token_factory = self._token_factory
 
         async def _on_event(event: ServerEvent) -> None:
             await self._on_ws_event(ws_id, thread, event)
+
+        async def _on_raw_event(data: dict[str, Any]) -> None:
+            etype = data.get("type", "")
+            if etype == "child_ws_approve_request":
+                await self._handle_child_approve_request(ws_id, thread, data)
 
         async def _on_stale() -> None:
             await self._cleanup_stale_route(ws_id)
@@ -524,6 +524,7 @@ class TurnstoneBot:
             token_factory=token_factory,
             on_event=_on_event,
             on_stale=_on_stale,
+            on_raw_event=_on_raw_event,
         )
 
     # -- event dispatch ------------------------------------------------------
@@ -796,6 +797,47 @@ class TurnstoneBot:
                 str(it.get("call_id", "")) for it in event.items if it.get("call_id")
             )
             self._pending_approval_msgs[(ws_id, cycle_id)] = (msg, call_ids)
+
+    async def _handle_child_approve_request(
+        self,
+        parent_ws_id: str,
+        thread: discord.abc.Messageable,
+        data: dict[str, Any],
+    ) -> None:
+        """Handle a child workstream's approval request (from coordinator SSE)."""
+        import discord
+
+        from turnstone.channels._formatter import format_approval_request
+        from turnstone.channels.discord.views import ApprovalView
+
+        child_ws_id = data.get("child_ws_id", "")
+        detail = data.get("detail", {})
+        if not child_ws_id or not detail:
+            return
+
+        cycle_id = detail.get("cycle_id", "")
+        items = detail.get("items", [])
+        if not items:
+            return
+
+        text = format_approval_request(items)
+        embed = discord.Embed(
+            title=f"Child Tool Approval Required",
+            description=text,
+            color=discord.Color.orange(),
+        )
+
+        owner_id = self._session_owners.get(parent_ws_id) or _thread_owner_id(
+            thread, thread_invokers=self._thread_invokers, channel_sessions=self._channel_sessions
+        )
+        # Store child_ws_id in footer so the button click routes to the child.
+        embed.set_footer(text=f"{child_ws_id}|{cycle_id}|{owner_id}")
+        msg = await thread.send(embed=embed, view=ApprovalView(self)._view)
+        call_ids = frozenset(
+            str(it.get("call_id", "")) for it in items if it.get("call_id")
+        )
+        self._pending_approval_msgs[(child_ws_id, cycle_id)] = (msg, call_ids)
+        log.info("discord.child_approval_request", child_ws_id=child_ws_id)
 
     async def _handle_intent_verdict(
         self,
