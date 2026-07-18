@@ -726,7 +726,6 @@ class MessageCog:
             channel_id=str(thread.id),
             name=thread_name,
             model=effective_model,
-            persona=persona,
             initial_message="",
             client_type="chat",
             kind="coordinator",

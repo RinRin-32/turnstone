@@ -989,8 +989,6 @@ class TurnstoneBot:
         self._channel_sessions[channel.id] = (ws_id, discord_user_id)
         if discord_user_id:
             self._session_owners[ws_id] = discord_user_id
-        if auto_stop:
-            self._auto_sessions.add(ws_id)
         await self.subscribe_ws(ws_id, channel)
         if initial_message:
             await self.router.send_message(ws_id, initial_message)
