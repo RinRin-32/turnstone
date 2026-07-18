@@ -192,6 +192,18 @@ class ChannelRouter:
 
     # -- model listing -------------------------------------------------------
 
+    async def admin_list_personas(self) -> list[dict[str, Any]]:
+        """Fetch all personas with IDs (admin API)."""
+        if self._console:
+            return await self._console.admin_list_personas()
+        return []
+
+    async def patch_persona(self, persona_id: str, **fields: object) -> dict[str, Any]:
+        """Update a persona via the admin API."""
+        if self._console:
+            return await self._console.patch_persona(persona_id, **fields)
+        return {}
+
     async def list_personas(self, *, cached: bool = False) -> list[dict[str, Any]]:
         """Fetch available persona choices, cached with TTL."""
         if cached:
@@ -611,7 +623,10 @@ class ChannelRouter:
         self._node_urls.pop(ws_id, None)
         try:
             if self._console:
-                await self._console.route_close(ws_id)
+                if ws_id in self._coordinator_wss:
+                    await self._console.close(ws_id)
+                else:
+                    await self._console.route_close(ws_id)
             else:
                 assert self._server is not None
                 await self._server.close_workstream(ws_id)

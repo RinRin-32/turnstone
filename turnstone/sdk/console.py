@@ -212,6 +212,17 @@ class AsyncTurnstoneConsole(_BaseClient):
             "GET", "/v1/api/personas", response_model=ListPersonaChoicesResponse
         )
 
+    async def admin_list_personas(self) -> list[dict[str, Any]]:
+        """GET /v1/api/admin/personas — all personas with IDs."""
+        data = await self._request("GET", "/v1/api/admin/personas")
+        return data.get("personas", [])
+
+    async def patch_persona(self, persona_id: str, **fields: object) -> dict[str, Any]:
+        """PATCH /v1/api/admin/personas/{persona_id} — edit persona fields."""
+        return await self._request(
+            "PATCH", f"/v1/api/admin/personas/{persona_id}", json_body=fields
+        )
+
     # -- routing proxy -------------------------------------------------------
 
     async def route_create_workstream(
@@ -486,6 +497,10 @@ class AsyncTurnstoneConsole(_BaseClient):
     async def route_close(self, ws_id: str) -> dict[str, Any]:
         """Close a workstream via the routing proxy."""
         return await self._request("POST", f"/v1/api/route/workstreams/{ws_id}/close", json_body={})
+
+    async def close(self, ws_id: str) -> dict[str, Any]:
+        """Close a workstream directly on the console (coordinator)."""
+        return await self._request("POST", f"/v1/api/workstreams/{ws_id}/close", json_body={})
 
     async def route_cancel(self, ws_id: str, *, force: bool = False) -> dict[str, Any]:
         """Cancel the current turn via the routing proxy."""

@@ -190,6 +190,28 @@ class MessageCog:
                 await cog_self._cmd_list_persona(interaction)
 
             @app_commands.command(
+                name="set-default-persona",
+                description="Set the default persona for new workstreams",
+            )
+            @app_commands.describe(
+                persona="Persona name to set as default",
+            )
+            async def set_default_persona(
+                self_cog: _Cog,  # noqa: N805
+                interaction: discord.Interaction,
+                persona: str,
+            ) -> None:
+                await cog_self._cmd_set_default_persona(interaction, persona)
+
+            @set_default_persona.autocomplete("persona")
+            async def _default_persona_autocomplete(
+                self_cog: _Cog,  # noqa: N805
+                interaction: discord.Interaction,
+                current: str,
+            ) -> list[app_commands.Choice[str]]:
+                return await cog_self._autocomplete_persona(interaction, current)
+
+            @app_commands.command(
                 name="help",
                 description="Show available Turnstone commands",
             )
@@ -998,3 +1020,37 @@ class MessageCog:
             else:
                 lines.append(f"**{name}**")
         await interaction.followup.send("\n".join(lines[:10]), ephemeral=True)
+
+    async def _cmd_set_default_persona(self, interaction: discord.Interaction, persona: str) -> None:
+        """Set the default persona."""
+        import discord
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            admin_personas = await self.ts.router.admin_list_personas()
+        except Exception:
+            await interaction.followup.send(
+                "Failed to fetch personas (admin access required).", ephemeral=True
+            )
+            return
+
+        target = next((p for p in admin_personas if p.get("name") == persona), None)
+        if target is None:
+            await interaction.followup.send(f"Persona '{persona}' not found.", ephemeral=True)
+            return
+
+        pid = target.get("id") or target.get("persona_id")
+        if not pid:
+            await interaction.followup.send("Cannot determine persona ID.", ephemeral=True)
+            return
+
+        try:
+            await self.ts.router.patch_persona(pid, is_default=True)
+        except Exception as exc:
+            await interaction.followup.send(f"Failed to set default: {exc}", ephemeral=True)
+            return
+
+        await interaction.followup.send(
+            f"**{persona}** is now the default persona.", ephemeral=True
+        )
+        log.info("discord.default_persona_set", persona=persona)
