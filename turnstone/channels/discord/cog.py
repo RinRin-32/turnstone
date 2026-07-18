@@ -77,14 +77,16 @@ class MessageCog:
             @app_commands.describe(
                 message="Your message to the assistant",
                 model="Model alias (leave blank for default)",
+                persona="Persona to use (leave blank for default)",
             )
             async def ask(
                 self_cog: _Cog,  # noqa: N805
                 interaction: discord.Interaction,
                 message: str,
                 model: str = "",
+                persona: str = "",
             ) -> None:
-                await cog_self._cmd_ask(interaction, message, model=model)
+                await cog_self._cmd_ask(interaction, message, model=model, persona=persona)
 
             @ask.autocomplete("model")
             async def _model_autocomplete(
@@ -94,6 +96,14 @@ class MessageCog:
             ) -> list[app_commands.Choice[str]]:
                 return await cog_self._autocomplete_model(interaction, current)
 
+            @ask.autocomplete("persona")
+            async def _ask_persona_autocomplete(
+                self_cog: _Cog,  # noqa: N805
+                interaction: discord.Interaction,
+                current: str,
+            ) -> list[app_commands.Choice[str]]:
+                return await cog_self._autocomplete_persona(interaction, current)
+
             @app_commands.command(
                 name="orchestrate",
                 description="Start an orchestrator workstream in a thread",
@@ -101,16 +111,14 @@ class MessageCog:
             @app_commands.describe(
                 task="The task or goal for the orchestrator",
                 model="Model alias (leave blank for default)",
-                persona="Persona to use (leave blank for default)",
             )
             async def orchestrate(
                 self_cog: _Cog,  # noqa: N805
                 interaction: discord.Interaction,
                 task: str,
                 model: str = "",
-                persona: str = "",
             ) -> None:
-                await cog_self._cmd_orchestrate(interaction, task, model=model, persona=persona)
+                await cog_self._cmd_orchestrate(interaction, task, model=model)
 
             @orchestrate.autocomplete("model")
             async def _orchestrate_model_autocomplete(
@@ -119,14 +127,6 @@ class MessageCog:
                 current: str,
             ) -> list[app_commands.Choice[str]]:
                 return await cog_self._autocomplete_model(interaction, current)
-
-            @orchestrate.autocomplete("persona")
-            async def _orchestrate_persona_autocomplete(
-                self_cog: _Cog,  # noqa: N805
-                interaction: discord.Interaction,
-                current: str,
-            ) -> list[app_commands.Choice[str]]:
-                return await cog_self._autocomplete_persona(interaction, current, kind="coordinator")
 
             @app_commands.command(name="status", description="Show workstream status")
             async def status(self_cog: _Cog, interaction: discord.Interaction) -> None:  # noqa: N805
@@ -583,7 +583,7 @@ class MessageCog:
         return entry is not None
 
     async def _cmd_ask(
-        self, interaction: discord.Interaction, message: str, *, model: str = ""
+        self, interaction: discord.Interaction, message: str, *, model: str = "", persona: str = ""
     ) -> None:
         """Create a new thread and workstream with an initial message."""
         import discord
@@ -636,6 +636,7 @@ class MessageCog:
             channel_id=str(thread.id),
             name=thread_name,
             model=effective_model,
+            persona=persona,
             initial_message="",
             client_type="chat",
         )
@@ -655,7 +656,7 @@ class MessageCog:
         )
 
     async def _cmd_orchestrate(
-        self, interaction: discord.Interaction, task: str, *, model: str = "", persona: str = ""
+        self, interaction: discord.Interaction, task: str, *, model: str = ""
     ) -> None:
         """Create a thread + workstream for orchestrator-style tasks."""
         import discord
