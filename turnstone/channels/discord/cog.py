@@ -736,6 +736,8 @@ class MessageCog:
 
     async def _cmd_stop_session(self, interaction: discord.Interaction) -> None:
         """Stop a channel-wide session."""
+        import discord
+
         channel = interaction.channel
         if channel is None or channel.id not in self.ts._channel_sessions:
             await interaction.response.send_message(
@@ -746,8 +748,12 @@ class MessageCog:
 
         await self.ts.stop_channel_session(channel.id)
         await interaction.response.send_message(
-            "**Session ended.** Messages will no longer be forwarded to Turnstone.",
+            "Session ended.",
             ephemeral=True,
+        )
+        await channel.send(
+            f"**Turnstone session ended by {interaction.user.mention}** — "
+            "messages will no longer be forwarded to the agent."
         )
 
     async def _cmd_help(self, interaction: discord.Interaction) -> None:
