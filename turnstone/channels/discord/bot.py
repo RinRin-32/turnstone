@@ -55,18 +55,38 @@ log = get_logger(__name__)
 _THREAD_INVOKER_CAP: int = 4096
 
 
-def _thread_owner_id(thread: discord.abc.Messageable) -> str:
-    """Return the Discord user ID who owns the thread / DM target.
+def _thread_owner_id(
+    thread: discord.abc.Messageable,
+    *,
+    thread_invokers: dict[int, int] | None = None,
+    channel_sessions: dict[int, tuple[str, str]] | None = None,
+) -> str:
+    """Return the Discord user ID who owns the thread / DM target / channel session.
 
     Used to gate approval button clicks to the session
     owner.  For Discord threads this is the thread creator
     (``thread.owner_id``).  For DM channels we use ``recipient.id``.
+    For channel-wide sessions the session creator is returned.
+    Falls back to ``_thread_invokers`` map for ``/ask``-created threads
+    where Discord reports the bot as owner.
     Returns ``""`` when the owner cannot be determined — the views
     then refuse the interaction.
     """
+    # 1. Channel-wide session — owner is the session creator.
+    if channel_sessions is not None:
+        entry = channel_sessions.get(thread.id)
+        if entry is not None and entry[1]:
+            return entry[1]
+    # 2. Explicit /ask invoker map (thread.owner_id is the bot for those).
+    if thread_invokers is not None:
+        owner = thread_invokers.get(thread.id)
+        if owner is not None:
+            return str(owner)
+    # 3. Native Discord thread owner.
     owner = getattr(thread, "owner_id", None)
     if owner:
         return str(owner)
+    # 4. DM recipient.
     recipient = getattr(thread, "recipient", None)
     if recipient is not None and getattr(recipient, "id", None):
         return str(recipient.id)
@@ -261,6 +281,13 @@ class TurnstoneBot:
         # legitimate follow-up from the human who ran the slash command).
         # Bounded LRU to prevent unbounded growth across long bot uptime.
         self._thread_invokers: OrderedDict[int, int] = OrderedDict()
+
+        # Channel-wide sessions: maps Discord TextChannel ID -> (ws_id, discord_user_id).
+        # When a session is active every message in the channel is forwarded to the
+        # workstream, prefixed with "[username]: ".
+        self._channel_sessions: dict[int, tuple[str, str]] = {}
+        # Auto-stop sessions: ws_ids that should be torn down when StreamEnd fires.
+        self._auto_sessions: set[str] = set()
 
         # Shared HTTP client for SSE connections.
         # Read timeout detects half-open connections (server sends ping=5s
@@ -734,7 +761,9 @@ class TurnstoneBot:
             # Footer format ws_id|cycle_id|owner — the persistent view
             # parses it back on click and routes the decision to exactly
             # this cycle.
-            embed.set_footer(text=f"{ws_id}|{cycle_id}|{_thread_owner_id(thread)}")
+            embed.set_footer(
+                text=f"{ws_id}|{cycle_id}|{_thread_owner_id(thread, thread_invokers=self._thread_invokers, channel_sessions=self._channel_sessions)}"
+            )
             msg = await thread.send(embed=embed, view=ApprovalView(self)._view)
             call_ids = frozenset(
                 str(it.get("call_id", "")) for it in event.items if it.get("call_id")
@@ -841,6 +870,18 @@ class TurnstoneBot:
         # Clean up pending approval message tracking (all cycles).
         self._pop_ws_approvals(ws_id)
 
+        # Auto-stop channel session if this was an auto-session.
+        if ws_id in self._auto_sessions:
+            channel_id = next(
+                (cid for cid, (wid, _uid) in self._channel_sessions.items() if wid == ws_id),
+                None,
+            )
+            if channel_id is not None:
+                del self._channel_sessions[channel_id]
+                # Schedule cleanup outside this SSE task (can't cancel self).
+                asyncio.create_task(self._cleanup_auto_session(ws_id, channel_id))
+            self._auto_sessions.discard(ws_id)
+
     # -- helpers -------------------------------------------------------------
 
     def _should_auto_approve(self, event: ApproveRequestEvent) -> bool:
@@ -877,6 +918,13 @@ class TurnstoneBot:
             return True
         return channel_id in self.config.allowed_channels
 
+    async def _cleanup_auto_session(self, ws_id: str, channel_id: int) -> None:
+        """Cancel SSE task and remove route for an auto-session that has ended."""
+        await self.unsubscribe_ws(ws_id)
+        await asyncio.to_thread(
+            self.storage.delete_channel_route, "discord_session", str(channel_id)
+        )
+
     def run(self, **kwargs: object) -> None:
         """Start the bot (blocking). Pass-through to ``commands.Bot.run``."""
         self._bot.run(self.config.bot_token, log_handler=None, **kwargs)  # type: ignore[arg-type]
@@ -884,6 +932,52 @@ class TurnstoneBot:
     async def start(self) -> None:
         """Start the bot (async). Use this for multi-adapter ``asyncio.gather``."""
         await self._bot.start(self.config.bot_token, reconnect=True)
+
+    # -- channel-wide session management --------------------------------------
+
+    async def start_channel_session(
+        self,
+        channel: discord.TextChannel,  # noqa: F821
+        discord_user_id: str = "",
+        initial_message: str = "",
+        *,
+        auto_stop: bool = False,
+        model: str = "",
+    ) -> str:
+        """Route every message in *channel* to a turnstone workstream.
+
+        Returns the workstream ID.  When *auto_stop* is ``True`` the
+        session is torn down on StreamEndEvent (single-turn).
+        *discord_user_id* is the Discord user who started it (for approval gating).
+        """
+        ws_id, _is_new = await self.router.get_or_create_workstream(
+            channel_type="discord_session",
+            channel_id=str(channel.id),
+            name=f"Session in #{channel.name}",
+            model=model,
+            initial_message="",
+            client_type="chat",
+        )
+        self._channel_sessions[channel.id] = (ws_id, discord_user_id)
+        if auto_stop:
+            self._auto_sessions.add(ws_id)
+        await self.subscribe_ws(ws_id, channel)
+        if initial_message:
+            await self.router.send_message(ws_id, initial_message)
+        return ws_id
+
+    async def stop_channel_session(self, channel_id: int) -> None:
+        """Tear down a channel-wide session and clean up its route."""
+        entry = self._channel_sessions.pop(channel_id, None)
+        if entry is None:
+            return
+        ws_id, _owner_id = entry
+        self._auto_sessions.discard(ws_id)
+        await self.unsubscribe_ws(ws_id)
+        # Remove the persisted route so storage doesn't accumulate stale entries.
+        await asyncio.to_thread(
+            self.storage.delete_channel_route, "discord_session", str(channel_id)
+        )
 
     async def send(self, channel_id: str, content: str) -> str:
         """Send a message to a Discord channel or user DM.

@@ -190,6 +190,8 @@ services:
       - console
     ports:
       - "${CONSOLE_HTTPS_PORT:-8443}:443"
+      # Plain HTTP for Tailscale Serve (terminates TLS, forwards HTTP here).
+      - "127.0.0.1:${CONSOLE_HTTP_PORT:-8080}:80"
       # SearxNG web UI — localhost-only (it has no auth). Browse https://localhost:8444.
       - "127.0.0.1:${SEARXNG_HTTPS_PORT:-8444}:8444"
     volumes:

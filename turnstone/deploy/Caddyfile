@@ -5,6 +5,13 @@
 #   docker compose exec caddy cat /data/caddy/pki/authorities/local/root.crt
 # See docs/tls.md (incl. the acme_ca→console alternative and why it's not default).
 
+# HTTP endpoint for Tailscale Serve (terminates TLS, forwards plain HTTP)
+:80 {
+	reverse_proxy console:8090 {
+		flush_interval -1
+	}
+}
+
 :443 {
 	# on_demand: a port-only site has no fixed name to pre-issue for; safe here
 	# because the issuer is Caddy's local CA, not a public one.
