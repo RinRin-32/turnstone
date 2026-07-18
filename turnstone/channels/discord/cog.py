@@ -94,6 +94,40 @@ class MessageCog:
             ) -> list[app_commands.Choice[str]]:
                 return await cog_self._autocomplete_model(interaction, current)
 
+            @app_commands.command(
+                name="orchestrate",
+                description="Start an orchestrator workstream in a thread",
+            )
+            @app_commands.describe(
+                task="The task or goal for the orchestrator",
+                model="Model alias (leave blank for default)",
+                persona="Persona to use (leave blank for default)",
+            )
+            async def orchestrate(
+                self_cog: _Cog,  # noqa: N805
+                interaction: discord.Interaction,
+                task: str,
+                model: str = "",
+                persona: str = "",
+            ) -> None:
+                await cog_self._cmd_orchestrate(interaction, task, model=model, persona=persona)
+
+            @orchestrate.autocomplete("model")
+            async def _orchestrate_model_autocomplete(
+                self_cog: _Cog,  # noqa: N805
+                interaction: discord.Interaction,
+                current: str,
+            ) -> list[app_commands.Choice[str]]:
+                return await cog_self._autocomplete_model(interaction, current)
+
+            @orchestrate.autocomplete("persona")
+            async def _orchestrate_persona_autocomplete(
+                self_cog: _Cog,  # noqa: N805
+                interaction: discord.Interaction,
+                current: str,
+            ) -> list[app_commands.Choice[str]]:
+                return await cog_self._autocomplete_persona(interaction, current)
+
             @app_commands.command(name="status", description="Show workstream status")
             async def status(self_cog: _Cog, interaction: discord.Interaction) -> None:  # noqa: N805
                 await cog_self._cmd_status(interaction)
@@ -106,8 +140,33 @@ class MessageCog:
                 name="start-session",
                 description="Start a Turnstone session in this channel (all messages are fed to the agent)",
             )
-            async def start_session(self_cog: _Cog, interaction: discord.Interaction) -> None:  # noqa: N805
-                await cog_self._cmd_start_session(interaction)
+            @app_commands.describe(
+                model="Model alias (leave blank for default)",
+                persona="Persona to use (leave blank for default)",
+            )
+            async def start_session(
+                self_cog: _Cog,  # noqa: N805
+                interaction: discord.Interaction,
+                model: str = "",
+                persona: str = "",
+            ) -> None:
+                await cog_self._cmd_start_session(interaction, model=model, persona=persona)
+
+            @start_session.autocomplete("model")
+            async def _session_model_autocomplete(
+                self_cog: _Cog,  # noqa: N805
+                interaction: discord.Interaction,
+                current: str,
+            ) -> list[app_commands.Choice[str]]:
+                return await cog_self._autocomplete_model(interaction, current)
+
+            @start_session.autocomplete("persona")
+            async def _session_persona_autocomplete(
+                self_cog: _Cog,  # noqa: N805
+                interaction: discord.Interaction,
+                current: str,
+            ) -> list[app_commands.Choice[str]]:
+                return await cog_self._autocomplete_persona(interaction, current)
 
             @app_commands.command(
                 name="stop-session",
@@ -122,6 +181,13 @@ class MessageCog:
             )
             async def global_link(self_cog: _Cog, interaction: discord.Interaction) -> None:  # noqa: N805
                 await interaction.response.send_modal(cog_self._global_link_modal_cls(cog_self))
+
+            @app_commands.command(
+                name="list-persona",
+                description="List available personas for workstream creation",
+            )
+            async def list_persona(self_cog: _Cog, interaction: discord.Interaction) -> None:  # noqa: N805
+                await cog_self._cmd_list_persona(interaction)
 
             @app_commands.command(
                 name="help",
@@ -588,6 +654,97 @@ class MessageCog:
             author=str(interaction.user),
         )
 
+    async def _cmd_orchestrate(
+        self, interaction: discord.Interaction, task: str, *, model: str = "", persona: str = ""
+    ) -> None:
+        """Create a thread + workstream for orchestrator-style tasks."""
+        import discord
+
+        user_id = await self.ts.router.resolve_user("discord", str(interaction.user.id))
+        if user_id is None and not await self._check_guild_access(interaction.guild_id):
+            await interaction.response.send_message(
+                "Your Discord account is not linked. Use `/link` first, "
+                "or ask an admin to use `/global-link`.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+
+        channel = interaction.channel
+        if channel is None:
+            await interaction.followup.send("Cannot determine channel.", ephemeral=True)
+            return
+
+        thread_name = task[:_THREAD_NAME_MAX] if len(task) > _THREAD_NAME_MAX else task
+
+        if isinstance(channel, discord.TextChannel):
+            thread = await channel.create_thread(
+                name=thread_name,
+                auto_archive_duration=self.ts.config.thread_auto_archive,
+                type=discord.ChannelType.public_thread,
+            )
+            self.ts.register_thread_invoker(thread.id, interaction.user.id)
+        else:
+            await interaction.followup.send(
+                "Cannot create a thread in this channel type.",
+                ephemeral=True,
+            )
+            return
+
+        effective_model = model
+        if not effective_model:
+            effective_model = await self.ts.router.get_channel_default_alias()
+        if not effective_model:
+            effective_model = self.ts.config.model
+
+        ws_id, _is_new = await self.ts.router.get_or_create_workstream(
+            channel_type="discord",
+            channel_id=str(thread.id),
+            name=thread_name,
+            model=effective_model,
+            persona=persona,
+            initial_message="",
+            client_type="chat",
+            kind="coordinator",
+        )
+
+        await self.ts.subscribe_ws(ws_id, thread)
+        await self.ts.router.send_message(ws_id, task)
+
+        await interaction.followup.send(
+            f"Orchestrator started in {thread.mention}",
+            ephemeral=True,
+        )
+        log.info(
+            "discord.orchestrate_workstream_created",
+            ws_id=ws_id,
+            thread_id=thread.id,
+            author=str(interaction.user),
+        )
+
+    async def _autocomplete_persona(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Return persona suggestions for command autocomplete."""
+        from discord import app_commands
+
+        try:
+            personas = await self.ts.router.list_personas(cached=True)
+        except Exception:
+            return []
+        choices: list[app_commands.Choice[str]] = []
+        for p in personas:
+            name = p.get("name", "")
+            if not name:
+                continue
+            if current and current.lower() not in name.lower():
+                continue
+            choices.append(app_commands.Choice(name=name, value=name))
+            if len(choices) >= 25:
+                break
+        return choices
+
     async def _autocomplete_model(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
@@ -690,17 +847,11 @@ class MessageCog:
 
     # -- channel session commands ---------------------------------------------
 
-    async def _cmd_start_session(self, interaction: discord.Interaction) -> None:
+    async def _cmd_start_session(
+        self, interaction: discord.Interaction, *, model: str = "", persona: str = ""
+    ) -> None:
         """Start a channel-wide session: all messages are forwarded to the agent."""
         import discord
-
-        user_id = await self.ts.router.resolve_user("discord", str(interaction.user.id))
-        if user_id is None:
-            await interaction.response.send_message(
-                "Your Discord account is not linked. Use `/link` first.",
-                ephemeral=True,
-            )
-            return
 
         channel = interaction.channel
         if not isinstance(channel, discord.TextChannel):
@@ -717,12 +868,19 @@ class MessageCog:
             )
             return
 
+        effective_model = model
+        if not effective_model:
+            effective_model = await self.ts.router.get_channel_default_alias()
+        if not effective_model:
+            effective_model = self.ts.config.model
+
         await interaction.response.defer(ephemeral=True)
 
         await self.ts.start_channel_session(
             channel,
             discord_user_id=str(interaction.user.id),
-            auto_stop=False,
+            model=effective_model,
+            persona=persona,
         )
         await interaction.followup.send(
             "**Session started!** All messages in this channel will be forwarded to "
@@ -799,4 +957,39 @@ class MessageCog:
             value="Close the current workstream thread",
             inline=False,
         )
+        embed.add_field(
+            name="/list-persona",
+            value="List available personas",
+            inline=False,
+        )
+        embed.add_field(
+            name="/orchestrate <task> [model] [persona]",
+            value="Start an orchestrator workstream in a thread",
+            inline=False,
+        )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    async def _cmd_list_persona(self, interaction: discord.Interaction) -> None:
+        """List available personas."""
+        import discord
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            personas = await self.ts.router.list_personas(cached=False)
+        except Exception:
+            await interaction.followup.send("Failed to fetch personas.", ephemeral=True)
+            return
+
+        if not personas:
+            await interaction.followup.send("No personas available.", ephemeral=True)
+            return
+
+        lines = []
+        for p in personas:
+            name = p.get("name", "?")
+            desc = p.get("description", "")
+            if desc:
+                lines.append(f"**{name}** — {desc}")
+            else:
+                lines.append(f"**{name}**")
+        await interaction.followup.send("\n".join(lines[:10]), ephemeral=True)

@@ -953,13 +953,12 @@ class TurnstoneBot:
         discord_user_id: str = "",
         initial_message: str = "",
         *,
-        auto_stop: bool = False,
         model: str = "",
+        persona: str = "",
     ) -> str:
         """Route every message in *channel* to a turnstone workstream.
 
-        Returns the workstream ID.  When *auto_stop* is ``True`` the
-        session is torn down on StreamEndEvent (single-turn).
+        Returns the workstream ID.
         *discord_user_id* is the Discord user who started it (for approval gating).
         """
         ws_id, _is_new = await self.router.get_or_create_workstream(
@@ -967,6 +966,7 @@ class TurnstoneBot:
             channel_id=str(channel.id),
             name=f"Session in #{channel.name}",
             model=model,
+            persona=persona,
             initial_message="",
             client_type="chat",
         )

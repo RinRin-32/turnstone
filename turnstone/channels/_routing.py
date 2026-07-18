@@ -189,6 +189,26 @@ class ChannelRouter:
 
     # -- model listing -------------------------------------------------------
 
+    async def list_personas(self, *, cached: bool = False) -> list[dict[str, Any]]:
+        """Fetch available persona choices, cached with TTL."""
+        if cached:
+            now = time.monotonic()
+            # Share models cache TTL for personas since they're similar data.
+            if self._models_cache and (now - self._models_cache_ts) < _MODELS_CACHE_TTL:
+                return self._models_cache.get("_personas", [])
+
+        if self._console:
+            resp = await self._console.list_personas()
+        else:
+            assert self._server is not None
+            resp = await self._server.list_personas()
+        data = resp.model_dump() if hasattr(resp, "model_dump") else resp
+        personas = data.get("personas", [])
+
+        if self._models_cache:
+            self._models_cache["_personas"] = personas
+        return personas
+
     async def list_models(self, *, cached: bool = False) -> dict[str, Any]:
         """Fetch available model aliases and defaults from the server/console.
 
@@ -259,8 +279,10 @@ class ChannelRouter:
         channel_id: str,
         name: str = "",
         model: str = "",
+        persona: str = "",
         initial_message: str = "",
         client_type: str = "",
+        kind: str = "",
     ) -> tuple[str, bool]:
         """Look up or create a workstream for a channel.
 
@@ -333,11 +355,13 @@ class ChannelRouter:
                 data = await self._console.route_create_workstream(
                     name=name,
                     model=model,
+                    persona=persona,
                     resume_ws=resume_ws,
                     skill=self._skill,
                     auto_approve=self._auto_approve,
                     auto_approve_tools=_tools_csv,
                     client_type=client_type,
+                    kind=kind,
                 )
                 ws_id = data.get("ws_id", "")
             else:
@@ -345,11 +369,13 @@ class ChannelRouter:
                 resp = await self._server.create_workstream(
                     name=name,
                     model=model,
+                    persona=persona,
                     resume_ws=resume_ws,
                     skill=self._skill,
                     auto_approve=self._auto_approve,
                     auto_approve_tools=_tools_csv,
                     client_type=client_type,
+                    kind=kind,
                 )
                 ws_id = resp.ws_id
                 data = {"ws_id": resp.ws_id, "name": resp.name}

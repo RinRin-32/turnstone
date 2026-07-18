@@ -61,6 +61,7 @@ from turnstone.api.schemas import (
 )
 from turnstone.api.server_schemas import (
     ListAttachmentsResponse,
+    ListPersonaChoicesResponse,
     UploadAttachmentResponse,
 )
 from turnstone.sdk._base import _BaseClient
@@ -205,6 +206,12 @@ class AsyncTurnstoneConsole(_BaseClient):
             "GET", "/v1/api/models", response_model=ListAvailableModelsResponse
         )
 
+    async def list_personas(self) -> ListPersonaChoicesResponse:
+        """GET /api/personas — enabled persona choices."""
+        return await self._request(
+            "GET", "/api/personas", response_model=ListPersonaChoicesResponse
+        )
+
     # -- routing proxy -------------------------------------------------------
 
     async def route_create_workstream(
@@ -222,6 +229,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         user_id: str = "",
         client_type: str = "",
         ws_id: str = "",
+        kind: str = "",
         attachments: list[AttachmentUpload] | None = None,
     ) -> dict[str, Any]:
         """Create a workstream via the console's routing proxy.
@@ -255,6 +263,8 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["user_id"] = user_id
         if client_type:
             body["client_type"] = client_type
+        if kind:
+            body["kind"] = kind
 
         if attachments:
             # The console's multipart route_create routes by `?ws_id=` only —

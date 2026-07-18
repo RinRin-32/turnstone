@@ -30,6 +30,7 @@ from turnstone.api.server_schemas import (
     ListAttachmentsResponse,
     ListAvailableModelsResponse,
     ListMemoriesResponse,
+    ListPersonaChoicesResponse,
     ListSavedWorkstreamsResponse,
     ListSkillSummaryResponse,
     ListWorkstreamsResponse,
@@ -97,6 +98,12 @@ class AsyncTurnstoneServer(_BaseClient):
             "GET", "/v1/api/models", response_model=ListAvailableModelsResponse
         )
 
+    async def list_personas(self) -> ListPersonaChoicesResponse:
+        """GET /v1/api/personas — enabled persona choices for creation pickers."""
+        return await self._request(
+            "GET", "/v1/api/personas", response_model=ListPersonaChoicesResponse
+        )
+
     async def create_workstream(
         self,
         *,
@@ -113,6 +120,7 @@ class AsyncTurnstoneServer(_BaseClient):
         client_type: str = "",
         notify_targets: str = "",
         project_id: str = "",
+        kind: str = "",
         attachments: list[AttachmentUpload] | None = None,
     ) -> CreateWorkstreamResponse:
         """Create a new workstream.
@@ -156,6 +164,8 @@ class AsyncTurnstoneServer(_BaseClient):
             body["client_type"] = client_type
         if notify_targets and notify_targets != "[]":
             body["notify_targets"] = notify_targets
+        if kind:
+            body["kind"] = kind
 
         if attachments:
             if not ws_id:
