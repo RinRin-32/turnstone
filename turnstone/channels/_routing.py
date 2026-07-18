@@ -193,17 +193,22 @@ class ChannelRouter:
         """Fetch available persona choices, cached with TTL."""
         if cached:
             now = time.monotonic()
-            # Share models cache TTL for personas since they're similar data.
             if self._models_cache and (now - self._models_cache_ts) < _MODELS_CACHE_TTL:
-                return self._models_cache.get("_personas", [])
+                cached_val = self._models_cache.get("_personas")
+                if cached_val is not None:
+                    return cached_val
 
-        if self._console:
-            resp = await self._console.list_personas()
-        else:
-            assert self._server is not None
-            resp = await self._server.list_personas()
-        data = resp.model_dump() if hasattr(resp, "model_dump") else resp
-        personas = data.get("personas", [])
+        try:
+            if self._console:
+                resp = await self._console.list_personas()
+            else:
+                assert self._server is not None
+                resp = await self._server.list_personas()
+            data = resp.model_dump() if hasattr(resp, "model_dump") else resp
+            personas = data.get("personas", [])
+        except Exception:
+            log.warning("channel_router.list_personas_failed", exc_info=True)
+            return []
 
         if self._models_cache:
             self._models_cache["_personas"] = personas

@@ -302,7 +302,10 @@ class AsyncTurnstoneConsole(_BaseClient):
 
         if ws_id:
             body["ws_id"] = ws_id
-        return await self._request("POST", "/v1/api/route/workstreams/new", json_body=body)
+        # Coordinator workstreams hit the console's direct endpoint,
+        # not the node route proxy.
+        endpoint = "/v1/api/workstreams/new" if kind == "coordinator" else "/v1/api/route/workstreams/new"
+        return await self._request("POST", endpoint, json_body=body)
 
     # -- routing proxy: attachments -----------------------------------------
 
