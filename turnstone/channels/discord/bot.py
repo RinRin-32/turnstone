@@ -288,6 +288,8 @@ class TurnstoneBot:
         self._channel_sessions: dict[int, tuple[str, str]] = {}
         # Auto-stop sessions: ws_ids that should be torn down when StreamEnd fires.
         self._auto_sessions: set[str] = set()
+        # Session owners: ws_id → discord_user_id for approval gating.
+        self._session_owners: dict[str, str] = {}
 
         # Shared HTTP client for SSE connections.
         # Read timeout detects half-open connections (server sends ping=5s
@@ -761,9 +763,18 @@ class TurnstoneBot:
             # Footer format ws_id|cycle_id|owner — the persistent view
             # parses it back on click and routes the decision to exactly
             # this cycle.
-            embed.set_footer(
-                text=f"{ws_id}|{cycle_id}|{_thread_owner_id(thread, thread_invokers=self._thread_invokers, channel_sessions=self._channel_sessions)}"
+            owner_id = self._session_owners.get(ws_id) or _thread_owner_id(
+                thread, thread_invokers=self._thread_invokers, channel_sessions=self._channel_sessions
             )
+            log.info(
+                "discord.approval_embed_owner",
+                ws_id=ws_id,
+                owner_id=owner_id or "(empty)",
+                session_owners=self._session_owners.get(ws_id) or "(not found)",
+                channel_id=getattr(thread, "id", None),
+                thread_type=type(thread).__name__,
+            )
+            embed.set_footer(text=f"{ws_id}|{cycle_id}|{owner_id}")
             msg = await thread.send(embed=embed, view=ApprovalView(self)._view)
             call_ids = frozenset(
                 str(it.get("call_id", "")) for it in event.items if it.get("call_id")
@@ -881,6 +892,7 @@ class TurnstoneBot:
                 # Schedule cleanup outside this SSE task (can't cancel self).
                 asyncio.create_task(self._cleanup_auto_session(ws_id, channel_id))
             self._auto_sessions.discard(ws_id)
+            self._session_owners.pop(ws_id, None)
 
     # -- helpers -------------------------------------------------------------
 
@@ -959,6 +971,8 @@ class TurnstoneBot:
             client_type="chat",
         )
         self._channel_sessions[channel.id] = (ws_id, discord_user_id)
+        if discord_user_id:
+            self._session_owners[ws_id] = discord_user_id
         if auto_stop:
             self._auto_sessions.add(ws_id)
         await self.subscribe_ws(ws_id, channel)
@@ -973,6 +987,7 @@ class TurnstoneBot:
             return
         ws_id, _owner_id = entry
         self._auto_sessions.discard(ws_id)
+        self._session_owners.pop(ws_id, None)
         await self.unsubscribe_ws(ws_id)
         # Remove the persisted route so storage doesn't accumulate stale entries.
         await asyncio.to_thread(

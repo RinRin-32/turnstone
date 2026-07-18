@@ -275,7 +275,6 @@ class MessageCog:
                 channel,
                 discord_user_id=str(message.author.id),
                 initial_message=f"[{message.author.display_name}]: {content}",
-                auto_stop=True,
                 model=mention_model,
             )
             log.info(
