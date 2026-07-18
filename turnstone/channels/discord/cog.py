@@ -1021,9 +1021,10 @@ class MessageCog:
         await interaction.followup.send("\n".join(lines[:10]), ephemeral=True)
 
     async def _cmd_set_default_persona(self, interaction: discord.Interaction, persona: str) -> None:
-        """Set the default persona."""
+        """Set the default persona and broadcast to channel."""
         import discord
 
+        channel = interaction.channel
         await interaction.response.defer(ephemeral=True)
         try:
             admin_personas = await self.ts.router.admin_list_personas()
@@ -1050,6 +1051,10 @@ class MessageCog:
             return
 
         await interaction.followup.send(
-            f"**{persona}** is now the default persona.", ephemeral=True
+            f"Default persona set to **{persona}**.", ephemeral=True
         )
+        if isinstance(channel, discord.TextChannel):
+            await channel.send(
+                f"**Default persona changed to {persona}** by {interaction.user.mention}."
+            )
         log.info("discord.default_persona_set", persona=persona)
