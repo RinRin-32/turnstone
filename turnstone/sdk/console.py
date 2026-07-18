@@ -207,9 +207,9 @@ class AsyncTurnstoneConsole(_BaseClient):
         )
 
     async def list_personas(self) -> ListPersonaChoicesResponse:
-        """GET /api/personas — enabled persona choices."""
+        """GET /v1/api/personas — enabled persona choices."""
         return await self._request(
-            "GET", "/api/personas", response_model=ListPersonaChoicesResponse
+            "GET", "/v1/api/personas", response_model=ListPersonaChoicesResponse
         )
 
     # -- routing proxy -------------------------------------------------------
@@ -427,6 +427,14 @@ class AsyncTurnstoneConsole(_BaseClient):
             json_body={"message": message},
         )
 
+    async def send(self, message: str, ws_id: str) -> dict[str, Any]:
+        """Send a message directly to a coordinator workstream on the console."""
+        return await self._request(
+            "POST",
+            f"/v1/api/workstreams/{ws_id}/send",
+            json_body={"message": message},
+        )
+
     async def route_approve(
         self,
         *,
@@ -437,12 +445,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         cycle_id: str = "",
         call_id: str = "",
     ) -> dict[str, Any]:
-        """Approve or reject a pending tool call via the routing proxy.
-
-        ``cycle_id`` / ``call_id`` select the approval cycle when the
-        workstream has several live (parallel task agents); omitting
-        both resolves the oldest.
-        """
+        """Approve or reject a pending tool call via the routing proxy."""
         body: dict[str, Any] = {"approved": approved}
         if feedback:
             body["feedback"] = feedback
@@ -454,6 +457,30 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["call_id"] = call_id
         return await self._request(
             "POST", f"/v1/api/route/workstreams/{ws_id}/approve", json_body=body
+        )
+
+    async def approve(
+        self,
+        *,
+        ws_id: str,
+        approved: bool = True,
+        feedback: str = "",
+        always: bool = False,
+        cycle_id: str = "",
+        call_id: str = "",
+    ) -> dict[str, Any]:
+        """Approve or reject a pending tool call directly on the console."""
+        body: dict[str, Any] = {"approved": approved}
+        if feedback:
+            body["feedback"] = feedback
+        if always:
+            body["always"] = True
+        if cycle_id:
+            body["cycle_id"] = cycle_id
+        if call_id:
+            body["call_id"] = call_id
+        return await self._request(
+            "POST", f"/v1/api/workstreams/{ws_id}/approve", json_body=body
         )
 
     async def route_close(self, ws_id: str) -> dict[str, Any]:

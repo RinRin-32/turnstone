@@ -126,7 +126,7 @@ class MessageCog:
                 interaction: discord.Interaction,
                 current: str,
             ) -> list[app_commands.Choice[str]]:
-                return await cog_self._autocomplete_persona(interaction, current)
+                return await cog_self._autocomplete_persona(interaction, current, kind="coordinator")
 
             @app_commands.command(name="status", description="Show workstream status")
             async def status(self_cog: _Cog, interaction: discord.Interaction) -> None:  # noqa: N805
@@ -724,7 +724,7 @@ class MessageCog:
         )
 
     async def _autocomplete_persona(
-        self, interaction: discord.Interaction, current: str
+        self, interaction: discord.Interaction, current: str, *, kind: str = ""
     ) -> list[app_commands.Choice[str]]:
         """Return persona suggestions for command autocomplete."""
         from discord import app_commands
@@ -738,6 +738,10 @@ class MessageCog:
             name = p.get("name", "")
             if not name:
                 continue
+            if kind:
+                applies = p.get("applies_to_kinds") or []
+                if kind not in applies:
+                    continue
             if current and current.lower() not in name.lower():
                 continue
             choices.append(app_commands.Choice(name=name, value=name))

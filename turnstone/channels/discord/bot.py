@@ -228,8 +228,9 @@ class TurnstoneBot:
         self._server_url = server_url.rstrip("/")
         self._console_url = console_url.rstrip("/") if console_url else ""
         self._api_token = api_token
-        # Server factory for direct SSE connections to server nodes
+        # Token factories for SSE connections
         self._token_factory = server_token_factory
+        self._console_token_factory = console_token_factory
         self.storage = storage
         # Router gets the appropriate factory based on mode:
         # console mode → console factory; direct mode → server factory
@@ -425,8 +426,15 @@ class TurnstoneBot:
         if ws_id in self._subscribed_ws:
             return
 
+        # Coordinator workstreams run on the console and need the console's
+        # JWT scope; interactive workstreams use the server token.
+        token_factory = (
+            self._console_token_factory
+            if ws_id in self.router._coordinator_wss
+            else self._token_factory
+        )
         task = asyncio.create_task(
-            self._sse_listener(ws_id, thread),
+            self._sse_listener(ws_id, thread, token_factory=token_factory),
             name=f"sse:{ws_id}",
         )
         self._sse_tasks[ws_id] = task
@@ -486,13 +494,21 @@ class TurnstoneBot:
 
     # -- SSE listener --------------------------------------------------------
 
-    async def _sse_listener(self, ws_id: str, thread: discord.abc.Messageable) -> None:
+    async def _sse_listener(
+        self,
+        ws_id: str,
+        thread: discord.abc.Messageable,
+        *,
+        token_factory: Callable[[], str] | None = None,
+    ) -> None:
         """SSE listener task for a workstream.
 
         Delegates the reconnect/backoff loop to :func:`run_sse_stream`;
         this wrapper just translates events to ``_on_ws_event`` calls and
         handles the 404 stale-route case.
         """
+        if token_factory is None:
+            token_factory = self._token_factory
 
         async def _on_event(event: ServerEvent) -> None:
             await self._on_ws_event(ws_id, thread, event)
@@ -505,7 +521,7 @@ class TurnstoneBot:
             log_prefix="discord",
             ws_id=ws_id,
             node_url_fn=self.router.get_node_url,
-            token_factory=self._token_factory,
+            token_factory=token_factory,
             on_event=_on_event,
             on_stale=_on_stale,
         )

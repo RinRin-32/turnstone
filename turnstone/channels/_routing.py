@@ -167,6 +167,9 @@ class ChannelRouter:
                 timeout=_WS_CREATE_TIMEOUT,
             )
 
+        # Track coordinator workstreams so send/SSE hits the console directly.
+        self._coordinator_wss: set[str] = set()
+
         # Cached channel default alias (TTL-based).
         self._channel_default_alias: str = ""
         self._channel_default_ts: float = 0.0
@@ -389,16 +392,28 @@ class ChannelRouter:
                 msg_err = "workstream creation returned empty ws_id"
                 raise RuntimeError(msg_err)
 
-            # When routed through the console, capture the node URL for
-            # direct SSE connections.
-            node_url = data.get("node_url", "")
+            # Track coordinator workstreams — they use the console for SSE
+            # and message dispatch instead of server nodes.
+            if kind == "coordinator":
+                self._coordinator_wss.add(ws_id)
+
+            # Capture the node URL for direct SSE connections.
+            # Coordinator workstreams run on the console itself, so SSE
+            # events come from the console URL, not a server node.
+            if kind == "coordinator" and self._console_url:
+                node_url = self._console_url
+            else:
+                node_url = data.get("node_url", "")
             if node_url:
                 self._node_urls[ws_id] = node_url.rstrip("/")
 
             # 3. Send the initial message if this is a brand-new workstream.
             if initial_message and not resume_ws:
                 if self._console:
-                    await self._console.route_send(initial_message, ws_id)
+                    if kind == "coordinator":
+                        await self._console.send(initial_message, ws_id)
+                    else:
+                        await self._console.route_send(initial_message, ws_id)
                 else:
                     assert self._server is not None
                     await self._server.send(initial_message, ws_id)
@@ -457,7 +472,10 @@ class ChannelRouter:
     async def send_message(self, ws_id: str, message: str) -> None:
         """Send a user message to a workstream via the server API."""
         if self._console:
-            await self._console.route_send(message, ws_id)
+            if ws_id in self._coordinator_wss:
+                await self._console.send(message, ws_id)
+            else:
+                await self._console.route_send(message, ws_id)
         else:
             assert self._server is not None
             await self._server.send(message, ws_id)
@@ -512,25 +530,24 @@ class ChannelRouter:
         feedback: str = "",
         always: bool = False,
     ) -> None:
-        """Approve or deny a pending tool call via the server API.
-
-        ``correlation_id`` is the cycle_id captured from the
-        ``approve_request`` event the adapter displayed; forwarding it
-        makes the decision land on exactly that cycle.  With parallel
-        task agents a workstream can hold several prompts — a
-        selector-less approve would resolve the OLDEST, which may not
-        be the message the user answered.  Empty string (policy /
-        auto-approve sweeps that act on "whatever is pending") keeps
-        the legacy oldest-first behavior.
-        """
+        """Approve or deny a pending tool call via the server API."""
         if self._console:
-            await self._console.route_approve(
-                ws_id=ws_id,
-                approved=approved,
-                feedback=feedback,
-                always=always,
-                cycle_id=correlation_id,
-            )
+            if ws_id in self._coordinator_wss:
+                await self._console.approve(
+                    ws_id=ws_id,
+                    approved=approved,
+                    feedback=feedback,
+                    always=always,
+                    cycle_id=correlation_id,
+                )
+            else:
+                await self._console.route_approve(
+                    ws_id=ws_id,
+                    approved=approved,
+                    feedback=feedback,
+                    always=always,
+                    cycle_id=correlation_id,
+                )
         else:
             assert self._server is not None
             await self._server.approve(
