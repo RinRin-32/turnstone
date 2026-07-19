@@ -16855,26 +16855,15 @@ class ChatSession:
             self._report_tool_result(call_id, "tts", msg, is_error=True)
             return call_id, msg
 
-        import hashlib, uuid
-        audio_bytes = result.audio_bytes
+        import base64
+        audio_b64 = base64.b64encode(result.audio_bytes).decode()
         media_type = result.media_type or "audio/mpeg"
-        ext = media_type.split("/")[-1] or "mp3"
-        content_hash = hashlib.sha256(audio_bytes).hexdigest()
-        filename = f"tts_{uuid.uuid4().hex[:8]}.{ext}"
-
-        try:
-            from turnstone.core.memory import save_attachment as _save_att
-            _save_att(
-                content_hash, filename, media_type, len(audio_bytes),
-                "audio", audio_bytes, "tool",
-            )
-        except Exception as exc:
-            msg = f"Error: failed to save audio: {exc}"
-            self._report_tool_result(call_id, "tts", msg, is_error=True)
-            return call_id, msg
-
+        # Truncate to stay within Discord's 8MB file limit — 4MB for b64 text.
+        max_b64 = 4_000_000
+        if len(audio_b64) > max_b64:
+            audio_b64 = audio_b64[:max_b64]
         output = (
-            f"Audio generated: {filename} (id={content_hash[:12]}...). "
+            f"TTS_AUDIO:{media_type}:{audio_b64}:END_AUDIO\n"
             f"Text: \"{text[:200]}\""
         )
         self._report_tool_result(call_id, "tts", output)

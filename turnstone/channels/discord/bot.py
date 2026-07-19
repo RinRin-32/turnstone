@@ -693,30 +693,22 @@ class TurnstoneBot:
             from turnstone.channels._formatter import try_build_media_embed
 
             # TTS audio: fetch the saved attachment and upload to Discord.
-            if event.name == "tts":
-                import re, io
-                match = re.search(r"id=([a-f0-9]+)", event.output)
+            if event.name == "tts" and event.output.startswith("TTS_AUDIO:"):
+                import re, io, base64
+                match = re.match(r"TTS_AUDIO:([^:]+):(.+?):END_AUDIO", event.output, re.DOTALL)
                 if match:
-                    att_id = match.group(1)
+                    media_type = match.group(1)
+                    audio_b64 = match.group(2)
                     try:
-                        node_url = await self.router.get_node_url(ws_id)
-                        ts = self._token_factory() if self._token_factory else ""
-                        url = f"{node_url}/v1/api/workstreams/{ws_id}/attachments/{att_id}/content"
-                        headers = {"Authorization": f"Bearer {ts}"} if ts else {}
-                        async with httpx.AsyncClient() as c:
-                            r = await c.get(url, headers=headers)
-                        if r.status_code == 200:
-                            audio_bytes = r.content
-                            ct = r.headers.get("content-type", "audio/mpeg")
-                            ext = ct.split("/")[-1] or "mpeg"
-                            disc_file = discord.File(io.BytesIO(audio_bytes), filename=f"tts.{ext}")
-                            await thread.send(file=disc_file)
-                            log.info("discord.tts_audio_sent", ws_id=ws_id, size=len(audio_bytes))
-                            return
-                        else:
-                            log.warning("discord.tts_audio_fetch_failed", ws_id=ws_id, status=r.status_code)
+                        audio_bytes = base64.b64decode(audio_b64)
+                        ext = media_type.split("/")[-1] or "mpeg"
+                        disc_file = discord.File(io.BytesIO(audio_bytes), filename=f"tts.{ext}")
+                        await thread.send(file=disc_file)
+                        log.info("discord.tts_audio_sent", ws_id=ws_id, size=len(audio_bytes))
+                        return
                     except Exception as exc:
                         log.warning("discord.tts_audio_error", ws_id=ws_id, error=str(exc))
+                        return
 
             media_result = None
             try:
