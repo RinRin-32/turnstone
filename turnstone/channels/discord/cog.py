@@ -321,7 +321,10 @@ class MessageCog:
                 await self.ts.subscribe_ws(ws_id, channel)
 
             attachment_ids = await self._upload_discord_attachments(ws_id, message)
-            await self.ts.router.send_message(ws_id, message.content, attachment_ids=attachment_ids)
+            text = message.content or (" " if attachment_ids else "")
+            if not text and not attachment_ids:
+                return
+            await self.ts.router.send_message(ws_id, text or ".", attachment_ids=attachment_ids)
             log.debug(
                 "discord.message_routed",
                 ws_id=ws_id,
@@ -333,9 +336,12 @@ class MessageCog:
         # --- Channel-wide session routing (anyone can participate) ---
         if channel.id in self.ts._channel_sessions:
             ws_id = self.ts._channel_sessions[channel.id][0]
-            content = f"[{message.author.display_name}]: {message.content}"
             attachment_ids = await self._upload_discord_attachments(ws_id, message)
-            await self.ts.router.send_message(ws_id, content, attachment_ids=attachment_ids)
+            text = message.content or (" " if attachment_ids else "")
+            content = f"[{message.author.display_name}]: {text}" if text else ""
+            if not content and not attachment_ids:
+                return
+            await self.ts.router.send_message(ws_id, content or ".", attachment_ids=attachment_ids)
             log.debug(
                 "discord.session_message_routed",
                 ws_id=ws_id,
