@@ -16835,7 +16835,7 @@ class ChatSession:
             from turnstone.core.audio import resolve_role_alias, synthesize
 
             alias = resolve_role_alias(
-                config_store=self._settings, registry=self._registry, role="tts"
+                config_store=self._config_store, registry=self._registry, role="tts"
             )
             if not alias:
                 msg = "Error: TTS backend not configured (set audio.tts_model_alias in Settings)"
