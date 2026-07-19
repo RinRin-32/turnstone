@@ -16863,7 +16863,7 @@ class ChatSession:
         filename = f"tts_{uuid.uuid4().hex[:8]}.{ext}"
 
         try:
-            from turnstone.core.attachments import save_attachment as _save_att
+            from turnstone.core.memory import save_attachment as _save_att
             _save_att(
                 content_hash, filename, media_type, len(audio_bytes),
                 "audio", audio_bytes, "tool",
