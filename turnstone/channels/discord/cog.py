@@ -604,20 +604,16 @@ class MessageCog:
     async def _upload_discord_attachments(
         self, ws_id: str, message: discord.Message
     ) -> list[str]:
-        """Upload image attachments from a Discord message and return attachment IDs."""
-        import io
-
+        """Upload Discord message attachments and return attachment IDs."""
         attachment_ids: list[str] = []
         for att in message.attachments:
-            if not att.content_type or not att.content_type.startswith("image/"):
-                continue
             try:
                 data = await att.read()
             except Exception:
                 log.debug("discord.attachment_read_failed", filename=att.filename)
                 continue
-            filename = att.filename or "image.png"
-            mime = att.content_type or "image/png"
+            filename = att.filename or "file"
+            mime = att.content_type or "application/octet-stream"
             try:
                 if ws_id in self.ts.router._coordinator_wss:
                     resp = await self.ts.router._console.coordinator_upload_attachment(
