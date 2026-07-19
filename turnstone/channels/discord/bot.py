@@ -692,6 +692,34 @@ class TurnstoneBot:
         if not event.is_error:
             from turnstone.channels._formatter import try_build_media_embed
 
+            # TTS audio: fetch the saved attachment and upload to Discord.
+            if event.name == "tts":
+                import re
+                match = re.search(r"id=([a-f0-9]+)", event.output)
+                if match:
+                    att_id = match.group(1)
+                    try:
+                        node_url = await self.router.get_node_url(ws_id)
+                        ts = self._token_factory() if self._token_factory else ""
+                        url = f"{node_url}/v1/api/workstreams/{ws_id}/attachments/{att_id}/content"
+                        headers = {"Authorization": f"Bearer {ts}"} if ts else {}
+                        async with httpx.AsyncClient() as c:
+                            r = await c.get(url, headers=headers)
+                        if r.status_code == 200 and r.headers.get("content-type", "").startswith("audio/"):
+                            audio_bytes = r.content
+                            filename = f"tts.{r.headers.get('content-type', 'audio/mpeg').split('/')[-1] or 'mp3'}"
+                            import io
+                            disc_file = discord.File(io.BytesIO(audio_bytes), filename=filename)
+                            embed = discord.Embed(
+                                title="TTS Audio",
+                                description=event.output[:200],
+                                color=discord.Color.dark_grey(),
+                            )
+                            await thread.send(embed=embed, file=disc_file)
+                            return
+                    except Exception:
+                        log.debug("discord.tts_audio_fetch_failed", ws_id=ws_id)
+
             media_result = None
             try:
                 media_result = await try_build_media_embed(
