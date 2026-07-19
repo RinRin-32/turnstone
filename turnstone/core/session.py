@@ -16830,6 +16830,8 @@ class ChatSession:
         call_id = item["call_id"]
         text = item["text"]
         voice = item.get("voice") or ""
+        if not voice:
+            voice = self._config_store.get("audio.tts_voice") or "alloy"
 
         try:
             from turnstone.core.audio import resolve_role_alias, synthesize
@@ -16846,7 +16848,7 @@ class ChatSession:
                 registry=self._registry,
                 alias=alias,
                 text=text,
-                voice=voice or "alloy",
+                voice=voice,
             )
         except Exception as exc:
             msg = f"Error: TTS failed: {exc}"
