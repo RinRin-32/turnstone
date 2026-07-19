@@ -321,7 +321,7 @@ class MessageCog:
                 await self.ts.subscribe_ws(ws_id, channel)
 
             attachment_ids = await self._upload_discord_attachments(ws_id, message)
-            text = message.content
+            text = await self._enrich_message(message, message.content)
             if not text:
                 if attachment_ids:
                     names = [a.filename for a in message.attachments if a.filename]
@@ -341,7 +341,7 @@ class MessageCog:
         if channel.id in self.ts._channel_sessions:
             ws_id = self.ts._channel_sessions[channel.id][0]
             attachment_ids = await self._upload_discord_attachments(ws_id, message)
-            text = message.content
+            text = await self._enrich_message(message, message.content)
             if not text and not attachment_ids:
                 return
             if not text:
@@ -362,7 +362,7 @@ class MessageCog:
             if not self.ts._is_allowed_channel(channel.id):
                 return
 
-            content = message.content
+            content = await self._enrich_message(message, message.content)
             if self.bot.user is not None:
                 content = content.replace(f"<@{self.bot.user.id}>", "").strip()
                 content = content.replace(f"<@!{self.bot.user.id}>", "").strip()
@@ -643,6 +643,40 @@ class MessageCog:
             if aid:
                 attachment_ids.append(aid)
         return attachment_ids
+
+    async def _enrich_message(
+        self, message: discord.Message, text: str
+    ) -> str:
+        """Append content from replied-to and linked messages."""
+        import re
+
+        ref = message.reference
+        if ref is not None and ref.message_id is not None:
+            try:
+                ref_msg = await message.channel.fetch_message(ref.message_id)
+                prefix = f"> **{ref_msg.author.display_name}**: {ref_msg.content}"
+                text = f"{text}\n\n{prefix}" if text else prefix
+            except Exception:
+                pass
+
+        links = re.findall(
+            r"https://discord\.com/channels/(\d+)/(\d+)/(\d+)", text
+        )
+        for guild_id, ch_id, msg_id in links:
+            try:
+                ch = self.bot.get_channel(int(ch_id))
+                if ch is None:
+                    continue
+                m = await ch.fetch_message(int(msg_id))
+                extra = f"[From {m.author.display_name} in #{ch.name}]: {m.content}"
+                text += f"\n{extra}"
+            except Exception:
+                continue
+
+        text = re.sub(
+            r"https://discord\.com/channels/\d+/\d+/\d+", "", text
+        ).strip()
+        return text
 
     async def _check_guild_access(self, guild_id: int | None) -> bool:
         """Return True if the guild has a global link (any member can use the bot)."""
