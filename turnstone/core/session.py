@@ -9834,6 +9834,7 @@ class ChatSession:
             "memory": self._prepare_memory,
             "recall": self._prepare_recall,
             "notify": self._prepare_notify,
+            "tts": self._prepare_tts,
             "watch": self._prepare_watch,
             "read_resource": self._prepare_read_resource,
             "use_prompt": self._prepare_use_prompt,
@@ -16787,6 +16788,95 @@ class ChatSession:
         msg = "Error: notification delivery failed"
         self._report_tool_result(call_id, "notify", msg, is_error=True)
         return call_id, msg
+
+    # -- TTS tool -------------------------------------------------------------
+
+    def _prepare_tts(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Prepare TTS — validate text length."""
+        text = (args.get("text") or "").strip()
+        if not text:
+            return {
+                "call_id": call_id,
+                "func_name": "tts",
+                "header": "\u2717 tts: empty text",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: text is required",
+            }
+        if len(text) > 5000:
+            return {
+                "call_id": call_id,
+                "func_name": "tts",
+                "header": "\u2717 tts: text too long",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: text exceeds 5000 character limit",
+            }
+        preview = text[:80] + "..." if len(text) > 80 else text
+        return {
+            "call_id": call_id,
+            "func_name": "tts",
+            "header": f"\U0001f3a4 tts: {preview}",
+            "preview": preview,
+            "needs_approval": False,
+            "execute": self._exec_tts,
+            "text": text,
+            "voice": (args.get("voice") or "").strip(),
+        }
+
+    def _exec_tts(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Synthesize text to speech."""
+        self._check_cancelled()
+        call_id = item["call_id"]
+        text = item["text"]
+        voice = item.get("voice") or ""
+
+        try:
+            from turnstone.core.audio import resolve_role_alias, synthesize
+
+            alias = resolve_role_alias(
+                config_store=self._settings, registry=self._registry, role="tts"
+            )
+            if not alias:
+                msg = "Error: TTS backend not configured (set audio.tts_model_alias in Settings)"
+                self._report_tool_result(call_id, "tts", msg, is_error=True)
+                return call_id, msg
+
+            result = synthesize(
+                registry=self._registry,
+                alias=alias,
+                text=text,
+                voice=voice or "alloy",
+            )
+        except Exception as exc:
+            msg = f"Error: TTS failed: {exc}"
+            self._report_tool_result(call_id, "tts", msg, is_error=True)
+            return call_id, msg
+
+        import hashlib, uuid
+        audio_bytes = result.audio_bytes
+        media_type = result.media_type or "audio/mpeg"
+        ext = media_type.split("/")[-1] or "mp3"
+        content_hash = hashlib.sha256(audio_bytes).hexdigest()
+        filename = f"tts_{uuid.uuid4().hex[:8]}.{ext}"
+
+        try:
+            from turnstone.core.attachments import save_attachment as _save_att
+            _save_att(
+                content_hash, filename, media_type, len(audio_bytes),
+                "audio", audio_bytes, "tool",
+            )
+        except Exception as exc:
+            msg = f"Error: failed to save audio: {exc}"
+            self._report_tool_result(call_id, "tts", msg, is_error=True)
+            return call_id, msg
+
+        output = (
+            f"Audio generated: {filename} (id={content_hash[:12]}...). "
+            f"Text: \"{text[:200]}\""
+        )
+        self._report_tool_result(call_id, "tts", output)
+        return call_id, output
 
     # -- Watch tool ----------------------------------------------------------
 
