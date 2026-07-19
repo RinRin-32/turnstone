@@ -694,7 +694,7 @@ class TurnstoneBot:
 
             # TTS audio: fetch the saved attachment and upload to Discord.
             if event.name == "tts":
-                import re
+                import re, io
                 match = re.search(r"id=([a-f0-9]+)", event.output)
                 if match:
                     att_id = match.group(1)
@@ -705,20 +705,18 @@ class TurnstoneBot:
                         headers = {"Authorization": f"Bearer {ts}"} if ts else {}
                         async with httpx.AsyncClient() as c:
                             r = await c.get(url, headers=headers)
-                        if r.status_code == 200 and r.headers.get("content-type", "").startswith("audio/"):
+                        if r.status_code == 200:
                             audio_bytes = r.content
-                            filename = f"tts.{r.headers.get('content-type', 'audio/mpeg').split('/')[-1] or 'mp3'}"
-                            import io
-                            disc_file = discord.File(io.BytesIO(audio_bytes), filename=filename)
-                            embed = discord.Embed(
-                                title="TTS Audio",
-                                description=event.output[:200],
-                                color=discord.Color.dark_grey(),
-                            )
-                            await thread.send(embed=embed, file=disc_file)
+                            ct = r.headers.get("content-type", "audio/mpeg")
+                            ext = ct.split("/")[-1] or "mpeg"
+                            disc_file = discord.File(io.BytesIO(audio_bytes), filename=f"tts.{ext}")
+                            await thread.send(file=disc_file)
+                            log.info("discord.tts_audio_sent", ws_id=ws_id, size=len(audio_bytes))
                             return
-                    except Exception:
-                        log.debug("discord.tts_audio_fetch_failed", ws_id=ws_id)
+                        else:
+                            log.warning("discord.tts_audio_fetch_failed", ws_id=ws_id, status=r.status_code)
+                    except Exception as exc:
+                        log.warning("discord.tts_audio_error", ws_id=ws_id, error=str(exc))
 
             media_result = None
             try:
