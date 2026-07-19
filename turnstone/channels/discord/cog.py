@@ -320,7 +320,8 @@ class MessageCog:
             if ws_id not in self.ts._subscribed_ws:
                 await self.ts.subscribe_ws(ws_id, channel)
 
-            await self.ts.router.send_message(ws_id, message.content)
+            attachment_ids = await self._upload_discord_attachments(ws_id, message)
+            await self.ts.router.send_message(ws_id, message.content, attachment_ids=attachment_ids)
             log.debug(
                 "discord.message_routed",
                 ws_id=ws_id,
@@ -333,7 +334,8 @@ class MessageCog:
         if channel.id in self.ts._channel_sessions:
             ws_id = self.ts._channel_sessions[channel.id][0]
             content = f"[{message.author.display_name}]: {message.content}"
-            await self.ts.router.send_message(ws_id, content)
+            attachment_ids = await self._upload_discord_attachments(ws_id, message)
+            await self.ts.router.send_message(ws_id, content, attachment_ids=attachment_ids)
             log.debug(
                 "discord.session_message_routed",
                 ws_id=ws_id,
@@ -359,11 +361,15 @@ class MessageCog:
             if not mention_model:
                 mention_model = self.ts.config.model
 
-            await self.ts.start_channel_session(
+            mention_text = f"[{message.author.display_name}]: {content}"
+            ws_id = await self.ts.start_channel_session(
                 channel,
                 discord_user_id=str(message.author.id),
-                initial_message=f"[{message.author.display_name}]: {content}",
                 model=mention_model,
+            )
+            attachment_ids = await self._upload_discord_attachments(ws_id, message)
+            await self.ts.router.send_message(
+                ws_id, mention_text, attachment_ids=attachment_ids
             )
             log.info(
                 "discord.mention_session_started",
@@ -594,6 +600,40 @@ class MessageCog:
             user_id=user_id,
             linked_by=str(interaction.user),
         )
+
+    async def _upload_discord_attachments(
+        self, ws_id: str, message: discord.Message
+    ) -> list[str]:
+        """Upload image attachments from a Discord message and return attachment IDs."""
+        import io
+
+        attachment_ids: list[str] = []
+        for att in message.attachments:
+            if not att.content_type or not att.content_type.startswith("image/"):
+                continue
+            try:
+                data = await att.read()
+            except Exception:
+                log.debug("discord.attachment_read_failed", filename=att.filename)
+                continue
+            filename = att.filename or "image.png"
+            mime = att.content_type or "image/png"
+            try:
+                if ws_id in self.ts.router._coordinator_wss:
+                    resp = await self.ts.router._console.coordinator_upload_attachment(
+                        ws_id, filename, data, mime_type=mime
+                    )
+                else:
+                    resp = await self.ts.router._console.route_upload_attachment(
+                        ws_id, filename, data, mime_type=mime
+                    )
+            except Exception:
+                log.debug("discord.attachment_upload_failed", ws_id=ws_id, filename=filename)
+                continue
+            aid = resp.attachment_id if hasattr(resp, "attachment_id") else resp.get("attachment_id", "")
+            if aid:
+                attachment_ids.append(aid)
+        return attachment_ids
 
     async def _check_guild_access(self, guild_id: int | None) -> bool:
         """Return True if the guild has a global link (any member can use the bot)."""

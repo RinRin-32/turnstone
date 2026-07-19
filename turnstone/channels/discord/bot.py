@@ -1013,6 +1013,7 @@ class TurnstoneBot:
         *,
         model: str = "",
         persona: str = "",
+        attachment_ids: list[str] | None = None,
     ) -> str:
         """Route every message in *channel* to a turnstone workstream.
 
@@ -1033,7 +1034,7 @@ class TurnstoneBot:
             self._session_owners[ws_id] = discord_user_id
         await self.subscribe_ws(ws_id, channel)
         if initial_message:
-            await self.router.send_message(ws_id, initial_message)
+            await self.router.send_message(ws_id, initial_message, attachment_ids=attachment_ids)
         return ws_id
 
     async def stop_channel_session(self, channel_id: int) -> None:

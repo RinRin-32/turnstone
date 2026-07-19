@@ -430,20 +430,30 @@ class AsyncTurnstoneConsole(_BaseClient):
             response_model=StatusResponse,
         )
 
-    async def route_send(self, message: str, ws_id: str) -> dict[str, Any]:
+    async def route_send(
+        self, message: str, ws_id: str, *, attachment_ids: list[str] | None = None
+    ) -> dict[str, Any]:
         """Send a message via the routing proxy."""
+        body: dict[str, Any] = {"message": message}
+        if attachment_ids is not None:
+            body["attachment_ids"] = attachment_ids
         return await self._request(
             "POST",
             f"/v1/api/route/workstreams/{ws_id}/send",
-            json_body={"message": message},
+            json_body=body,
         )
 
-    async def send(self, message: str, ws_id: str) -> dict[str, Any]:
-        """Send a message directly to a coordinator workstream on the console."""
+    async def send(
+        self, message: str, ws_id: str, *, attachment_ids: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Send a message directly on the console."""
+        body: dict[str, Any] = {"message": message}
+        if attachment_ids is not None:
+            body["attachment_ids"] = attachment_ids
         return await self._request(
             "POST",
             f"/v1/api/workstreams/{ws_id}/send",
-            json_body={"message": message},
+            json_body=body,
         )
 
     async def route_approve(

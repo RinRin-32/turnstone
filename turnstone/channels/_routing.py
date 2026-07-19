@@ -481,16 +481,18 @@ class ChannelRouter:
 
     # -- message dispatch ----------------------------------------------------
 
-    async def send_message(self, ws_id: str, message: str) -> None:
+    async def send_message(
+        self, ws_id: str, message: str, *, attachment_ids: list[str] | None = None
+    ) -> None:
         """Send a user message to a workstream via the server API."""
         if self._console:
             if ws_id in self._coordinator_wss:
-                await self._console.send(message, ws_id)
+                await self._console.send(message, ws_id, attachment_ids=attachment_ids)
             else:
-                await self._console.route_send(message, ws_id)
+                await self._console.route_send(message, ws_id, attachment_ids=attachment_ids)
         else:
             assert self._server is not None
-            await self._server.send(message, ws_id)
+            await self._server.send(message, ws_id, attachment_ids=attachment_ids)
         log.debug("channel_router.send_message", ws_id=ws_id)
 
     async def evaluate_tool_policies(
